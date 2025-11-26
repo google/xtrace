@@ -1,0 +1,1343 @@
+#!/bin/bash
+
+# Copyright (C) 2024 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+#####################################################################
+# Android XR xtrace
+#
+# A Perfetto tracing tool.
+# - Good defaults for Android XR performance analysis.
+# - Handy GPU and CPU thread per-frame usage stats.
+# - Can trace an attached adb device or the local PC.
+#
+# Installation:
+# - Unzip xtrace package somewhere.
+# - Add the location of this xtrace script to your PATH.
+#
+# Requirements:
+# - bash environment (ie: Git Bash or MSys on Windows).
+# - python (for auto-open feature).
+# - perl
+
+
+export MSYS_NO_PATHCONV=1
+
+available_atrace_categories() {
+  echo $(adb shell atrace --list 2> /dev/null | sed -r 's/ *(.*) - .*/\1/g')
+}
+
+is_adb_root() {
+  if [[ -z "${_IS_ROOTED_STATUS}" ]]; then
+    adb root > /dev/null 2>&1
+    if adb shell 'su 0 whoami' 2> /dev/null | grep -q 'root'; then
+      _IS_ROOTED_STATUS=true
+    else
+      _IS_ROOTED_STATUS=false
+    fi
+  fi
+
+  [[ "${_IS_ROOTED_STATUS}" == true ]]
+}
+
+# echo if adb device is rooted.
+ecRT() {
+  if is_adb_root; then
+    echo "$@"
+  fi
+}
+
+# echo if adb device is unrooted.
+ecNR() {
+  if ! is_adb_root; then
+    echo "$@"
+  fi
+}
+
+show_help_and_exit() {
+  echo "syntax: xtrace [options] [atrace categories] [perfetto categories] [ftrace sources]"
+  echo ""
+  echo "Configure device tracing options:"
+  echo "  (no tracing is done with these options)"
+  ecNR "  [--enable-gpu]           Enable GPU tracing on the device."
+  ecNR "                           Note: Restart the app and then trace with --gpu1 or --gpu2."
+  ecNR "  [--disable-gpu]          Disable GPU tracing on the device"
+  ecRT "  [--enable-gpu]           Enable high-res GPU tracing (--gpu2) on the device and restart services"
+  ecRT "  [--disable-gpu]          Disable GPU tracing on the device and restart services"
+  ecRT "  [--enable-gpu-no-stop]   Enable high-res GPU tracing (--gpu2) without restarting services"
+  ecRT "  [--disable-gpu-no-stop]  Disable GPU tracing without restarting services"
+  ecRT "  [--disable-dynamic-policy]  [XR] Disable dynamic policy and restart services"
+  ecRT "  [--lock-head]            [XR] Lock to a fake head pose"
+  ecRT "  [--unlock-head]          [XR] Unlock the head pose"
+  echo "  [--screen-timeout <ms>]  Set screen timeout and wake up the device. <ms> can be"
+  echo "                           an integer ms or a duration string like 1h20m."
+  ecNR "                           Note: proximity sensor must be touched to wake device."
+  echo ""
+  echo "Processing options:"
+  echo "  [-f /path/to/trace]      Load existing trace file instead of recording a trace"
+  echo "  [--big]                  Load trace via trace_processor_shell (required for ~300MB+)"
+  echo "  [-q /path/to/query.sql]  Run the given perfetto SQL query on trace output"
+  echo "  [--ui-query query.sql]   Run the given SQL query in the Perfetto UI (not compatible with --big)"
+  echo "  [--csv-output]           Output unfiltered CSV for SQL queries"
+  echo "  [--verbose-sql-logs]     Show verbose perfetto trace parsing logs during SQL query"
+  echo "  [--frame-stats]          Print frame stats (on by default)"
+  echo "  [--no-frame-stats]       Do not print frame stats"
+  echo "  [--top]                  Print the top CPU usage by process"
+  echo "  [--no-open]              Do not open the trace in the browser"
+  echo "  [--verbose]              Print verbose output"
+  echo "  [--avg <event_name>]     Print average duration in MS of given slice event along with frame-stats"
+  echo "                           Note: Wildcard is %. \"@\" characters must be escaped."
+  echo "                           Note: Duration is wall-clock-based, not thread run/sleep based."
+  echo ""
+  echo "Trace recording options:"
+  echo "  [--local]                Trace local OS instead of adb device (requires perfetto instrumentation)."
+  echo "  [-t <duration_ms>]       Duration to trace (default is until Ctrl-C). Also supports h/m/s suffix:"
+  echo "                           Examples: \"1m5s\" (1 minute + 5 seconds) or \"300\" (300 ms)"
+  echo "  [-o <output_file_or_dir>]  Write trace to a file or directory"
+  echo "  [-b <buffer_size_kb>]    Size of trace buffer in KB"
+  echo "  [-p /path/to/perfetto]   Path to perfetto tool if it's not in \$PATH"
+  echo "  [-c /path/to/config]     Use existing textproto config file instead of generating it"
+  echo "  [-i <period_ms>]         Incremental update period in ms"
+  echo "  [--screenshot]           [XR] Capture a raw screenshot alongside the trace"
+  ecRT "  [--lock-frequencies]     [XR] Lock CPU, GPU and DDR frequencies for more consistent measurements."
+  ecRT "                           Note: Performance will be different from normal device conditions. This"
+  ecRT "                            option is useful for A/B testing different CPU or GPU code to measure"
+  ecRT "                            which is faster."
+  ecRT "                           Note: Dynamic Policy can override the locked frequencies in some cases,"
+  ecRT "                            such as during app transitions. For best results, start the trace after"
+  ecRT "                            the target app is already running."
+  ecRT "  [--gpu]                  Include kgsl ftrace GPU data (on by default)"
+  echo "  [--gpu1]                 Include GPU slice events and GPU frame stats"
+  echo "  [--gpu2]                 Include detailed GPU events (has significant GPU overhead)"
+  echo "  [--counters]             Include GPU counters"
+  echo "  [--vk]                   Include Vulkan API tracing"
+  echo "  [--no-ftrace]            Do not include common ftrace data"
+  echo "  [--no-atrace]            Do not include common atrace categories"
+  echo "  [--no-perfetto]          Do not include common perfetto categories"
+  echo "  [--no-atrace-apps]       Do not include atrace from all apps (default)"
+  echo "  [--atrace-apps <app>]    Include atrace from <app> (\"*\" for all apps). Note this has very high"
+  echo "                           CPU impact for apps with high frequency events (such as Unity Development"
+  echo "                           builds), invalidating overall frame timing."
+  echo "  [--binary-config]        Send binary config instead of text (requires protoc)"
+  echo "  [--write-args <file>]    Write key args to <file> for use as title"
+  echo "  [-d <category>] ...      Disabled categories"
+  echo "  [<category>] ...         Enabled perfetto or atrace categories"
+  echo "  [<ftrace category>] ...  Enabled ftrace categories, must contain / character (ie: kmem/rss_stat)"
+  echo ""
+  echo "Examples:"
+  echo "  xtrace                           Trace adb device until Ctrl-C"
+  echo "  xtrace -t 1s                     Trace for 1 second"
+  echo "  xtrace gfx                       Include gfx category (disabled-by-default)"
+  echo '  xtrace -d "*" wm gfx             Only trace wm and gfx'
+  echo "  xtrace -f ./trace                Open ./trace in browser"
+  echo "  xtrace -f ./trace -q ./query     Run SQL query on ./trace"
+  echo "  xtrace --big -b 500000           Record and view a big trace"
+  echo "  xtrace --big -f ./trace          Open big trace in browser"
+  echo '  xtrace --atrace-apps "*"         Include all atrace apps events'
+  echo "  xtrace --avg %doFrame%           Show average durations of slice events matching *doFrame*"
+  echo ""
+  echo "--frame-stats output:"
+  echo "  Note: CPU and GPU usage is based on runtime durations, ignoring frequency."
+  echo "  W H: Width, height of framebuffer (when available)"
+  echo "  GpuMSPF: GPU usage in ms per frame."
+  echo "  FPS: Frames per second."
+  echo "  Frames: Total submitted frame count."
+  echo "  Drops: Total frame drops."
+  echo "  DropsPM: Frame drops per minute."
+  echo "  CpuMSPF: Total CPU usage of the process in ms per frame."
+  echo "  TopThread1 TopThread2: The top two threads by CPU usage."
+  echo "  MSPF1 MSPF2: CPU usage of the top two threads in ms per frame."
+  echo "  Dur: Duration in seconds that the process executed frames."
+  echo "  GpuFreq: Average GPU frequency during the trace (not per process)."
+  echo "  Watts: Average power usage in watts of the whole system (not per process)."
+  echo ""
+  echo "--top output:"
+  echo "  Note: CPU usage is based on durations, ignoring CPU frequency."
+  echo "  Rank: Process rank ordered by total CPU usage."
+  echo "  GpuPct: Percent GPU core usage (100 * GPU running duration / trace duration)."
+  echo "  CpuPct: Percent CPU core usage (100 * CPU running duration / trace duration)."
+  echo "  TopThread1 TopThread2: The top two threads by CPU usage."
+  echo "  CpuPct1 CpuPct2: Percent CPU core usage of the top two threads."
+  echo ""
+  echo "Special categories:"
+  echo "  chrome.*: Chrome trace categories (\"chrome.\" prefix is removed)"
+  echo "  Chrome gfx: chrome.ui chrome.cc chrome.gpu"
+  echo "  Android gfx: gfx view wm"
+  echo ""
+  echo "Available Android categories:"
+  echo "  $(available_atrace_categories)" | tr '\n' ' '
+  exit 1
+}
+
+cpu=$(uname -m)
+os=$(uname -o)
+
+# Use python3 if it exists, otherwise python.
+python=python
+python3 -c quit > /dev/null 2>&1 && python=python3
+
+xtrace_dir=$(dirname "$0")
+
+bg_bash="bash -mc"
+if [[ "${os}" = "Msys" ]]; then
+  host_tools_dir="${xtrace_dir}/third_party/perfetto/windows-amd64"
+  bg_bash="mintty bash -mc"
+elif [[ "${os}" = "Darwin" ]] && [[ "${cpu}" = "x86_64" ]]; then
+  host_tools_dir="${xtrace_dir}/third_party/perfetto/mac-amd64"
+elif [[ "${os}" = "Darwin" ]]; then
+  host_tools_dir="${xtrace_dir}/third_party/perfetto/mac-arm64"
+else
+  host_tools_dir="${xtrace_dir}/third_party/perfetto/linux-amd64"
+fi
+
+if [[ "${os}" = "Msys" ]]; then
+  cygpathw='cygpath -w'
+else
+  cygpathw='echo'
+fi
+
+push_config=true
+use_binary_config=false
+auto_open=true
+screenshot=false
+lock_frequencies=false
+lock_head=''
+enable_gpu=false
+enable_gpu_restart_services=true
+disable_gpu=false
+disable_gpu_restart_services=true
+screen_timeout_ms=0
+skip_tracing=false
+include_gpu=false
+include_gpu2=false
+gpu2_low_overhead=false
+include_android_thermal_config=false
+sql_path=''
+auto_set_sql_path=false
+ui_sql_path=""
+gpu_stats_filename="gpu_stats2.sql"
+kgsl_ui_sql_path="${xtrace_dir}/queries/kgsl_gpu_events_for_ui.sql"
+custom_stats=()
+print_frame_stats=true
+print_cpu_top=false
+gpu_starting_freq_khz=0
+is_filtered_query_output=true
+verbose_sql_logs=false
+is_local=false
+is_android=true
+time_ms=0
+include_ftrace_defaults=true
+include_atrace_defaults=true
+include_perfetto_defaults=true
+symbolize_ksyms=false
+atrace_apps=()
+ftrace_events=()
+categories=()
+chrome_categories=''
+disabled_categories=()
+chrome_disabled_categories=''
+now=$(date +"%Y-%m-%d_%H-%M-%S")
+from_file=false
+is_big=false
+output_file=''
+config_filename="perfetto-${RANDOM}.config"
+config_filepath="/tmp/${config_filename}"
+use_existing_config=false
+output_args_file=''
+title_args=()
+perfetto="${host_tools_dir}/perfetto"
+incremental_update_period_ms=1000
+buffer_size_kb=140000
+fill_policy=RING_BUFFER
+verbose_logs=false
+verbose_err="/dev/null"
+
+gpu_counter_producer="agi_launch_producer"
+android_gpu_counter_producer_filepath="/data/local/tmp/${gpu_counter_producer}"
+host_gpu_counter_producer_filepath="${xtrace_dir}/third_party/agi/${gpu_counter_producer}"
+
+duration_to_ms() {
+  local duration="$1"
+  local ms=$(($(echo "${duration}" | sed 's/h/*3600000+/g; s/m/*60000+/g; s/s/*1000+/g' | sed 's/+$/ /g')))
+  echo "${ms}"
+}
+
+verbose() {
+  if [[ "${verbose_logs}" == true ]]; then
+    echo "$1"
+  fi
+}
+
+# Parse args
+args=("$@")
+
+num_args="${#args[@]}"
+for (( i = 0; i < num_args; i++ )); do
+  if [[ "${args[${i}]}" = "--help" ]]; then
+    show_help_and_exit
+  elif [[ "${args[${i}]}" = "--local" ]]; then
+    is_local=true
+  elif [[ "${args[${i}]}" = "-t" ]]; then
+    i=$((i+1))
+    time_ms=$(duration_to_ms "${args[${i}]}")
+    fill_policy=DISCARD
+  elif [[ "${args[${i}]}" = "--big" ]]; then
+    is_big=true
+  elif [[ "${args[${i}]}" = "-f" ]]; then
+    i=$((i+1))
+    output_file=$($cygpathw "${args[${i}]}")
+    from_file=true
+  elif [[ "${args[${i}]}" = "-o" ]]; then
+    i=$((i+1))
+    output_file=$($cygpathw "${args[${i}]}")
+  elif [[ "${args[${i}]}" = "-b" ]]; then
+    i=$((i+1))
+    buffer_size_kb="${args[${i}]}"
+  elif [[ "${args[${i}]}" = "-p" ]]; then
+    i=$((i+1))
+    perfetto="${args[${i}]}"
+  elif [[ "${args[${i}]}" = "-i" ]]; then
+    i=$((i+1))
+    incremental_update_period_ms="${args[${i}]}"
+  elif [[ "${args[${i}]}" = "-q" ]]; then
+    i=$((i+1))
+    sql_path="${args[${i}]}"
+  elif [[ "${args[${i}]}" = "--ui-query" ]]; then
+    i=$((i+1))
+    ui_sql_path="$($cygpathw "${args[${i}]}")"
+  elif [[ "${args[${i}]}" = "--csv-output" ]]; then
+    is_filtered_query_output=false
+  elif [[ "${args[${i}]}" = "--verbose-sql-logs" ]]; then
+    verbose_sql_logs=true
+  elif [[ "${args[${i}]}" = "--frame-stats" ]]; then
+    print_frame_stats=true
+  elif [[ "${args[${i}]}" = "--no-frame-stats" ]]; then
+    print_frame_stats=false
+  elif [[ "${args[${i}]}" = "--avg" ]]; then
+    i=$((i+1))
+    custom_stats+=("${args[${i}]}")
+  elif [[ "${args[${i}]}" = "--top" ]]; then
+    print_cpu_top=true
+  elif [[ "${args[${i}]}" = "-d" ]]; then
+    i=$((i+1))
+    cat="${args[${i}]}"
+    if [[ "${cat}" == chrome.* ]]; then
+      chrome_disabled_categories+="\\\"${cat#"chrome."}\\\","
+    else
+      disabled_categories+=("${cat}")
+    fi
+  elif [[ "${args[${i}]}" = "--write-args" ]]; then
+    i=$((i+1))
+    output_args_file="${args[${i}]}"
+  elif [[ "${args[${i}]}" = "--enable-gpu" ]]; then
+    enable_gpu=true
+    skip_tracing=true
+  elif [[ "${args[${i}]}" = "--enable-gpu-no-stop" ]]; then
+    enable_gpu=true
+    enable_gpu_restart_services=false
+    skip_tracing=true
+  elif [[ "${args[${i}]}" = "--disable-gpu" ]]; then
+    disable_gpu=true
+    skip_tracing=true
+  elif [[ "${args[${i}]}" = "--disable-gpu-no-stop" ]]; then
+    disable_gpu=true
+    disable_gpu_restart_services=false
+    skip_tracing=true
+  elif [[ "${args[${i}]}" = "--disable-dynamic-policy" ]]; then
+    disable_dynamic_policy=true
+    skip_tracing=true
+  elif [[ "${args[${i}]}" = "--lock-head" ]]; then
+    lock_head="1"
+    skip_tracing=true
+  elif [[ "${args[${i}]}" = "--unlock-head" ]]; then
+    lock_head="0"
+    skip_tracing=true
+  elif [[ "${args[${i}]}" = "--screen-timeout" ]]; then
+    i=$((i+1))
+    screen_timeout_ms=$(duration_to_ms "${args[${i}]}")
+    skip_tracing=true
+  elif [[ "${args[${i}]}" = "--screenshot" ]]; then
+    screenshot=true
+  elif [[ "${args[${i}]}" = "--lock-frequencies" ]]; then
+    lock_frequencies=true
+  elif [[ "${args[${i}]}" = "--gpu" ]]; then
+    include_gpu=true
+    title_args+=("gpu")
+  elif [[ "${args[${i}]}" = "--gpu2" ]]; then
+    include_gpu=true
+    include_gpu2=true
+    title_args+=("gpu2")
+  elif [[ "${args[${i}]}" = "--gpu1" ]]; then
+    include_gpu=true
+    include_gpu2=true
+    gpu2_low_overhead=true
+    title_args+=("gpu1")
+  elif [[ "${args[${i}]}" = "--counters" ]]; then
+    include_counters=true
+    title_args+=("counters")
+  elif [[ "${args[${i}]}" = "--vk" ]]; then
+    include_vulkan=true
+    title_args+=("vk")
+  elif [[ "${args[${i}]}" = "--no-atrace-apps" ]]; then
+    atrace_apps=()
+    title_args+=("no-atrace-apps")
+  elif [[ "${args[${i}]}" = "--atrace-apps" ]]; then
+    i=$((i+1))
+    atrace_apps+=("${args[${i}]}")
+    title_args+=("atrace-apps")
+  elif [[ "${args[${i}]}" = "--no-open" ]]; then
+    auto_open=false
+  elif [[ "${args[${i}]}" = "--verbose" ]]; then
+    verbose_logs=true
+    verbose_err="/dev/stderr"
+  elif [[ "${args[${i}]}" = "--no-push-config" ]]; then
+    push_config=false
+  elif [[ "${args[${i}]}" = "--binary-config" ]]; then
+    use_binary_config=true
+  elif [[ "${args[${i}]}" = "-c" ]]; then
+    i=$((i+1))
+    config_filepath="${args[${i}]}"
+    use_existing_config=true
+  elif [[ "${args[${i}]}" = "--no-ftrace" ]]; then
+    include_ftrace_defaults=false
+    title_args+=("no-ftrace")
+  elif [[ "${args[${i}]}" = "--no-atrace" ]]; then
+    include_atrace_defaults=false
+    title_args+=("no-atrace")
+  elif [[ "${args[${i}]}" = "--no-perfetto" ]]; then
+    include_perfetto_defaults=false
+    title_args+=("no-perfetto")
+  elif [[ "${args[${i}]}" = "--symbolize-ksyms" ]]; then
+    symbolize_ksyms=true
+  elif [[ "${args[${i}]}" = -* ]]; then
+    echo "warning: ignoring unknown option ${args[${i}]}"
+  else
+    cat="${args[${i}]}"
+    if [[ "${cat}" == */* ]]; then
+      ftrace_events+=("${cat}")
+    elif [[ "${cat}" == chrome.* ]]; then
+      chrome_categories+="\\\"${cat#"chrome."}\\\","
+    else
+      categories+=("${cat}")
+    fi
+  fi
+done
+
+# Strip trailing comma:
+chrome_categories="${chrome_categories%","}"
+chrome_disabled_categories="${chrome_disabled_categories%","}"
+
+adreno_perfcounter_file="/sys/class/kgsl/kgsl-3d0/perfcounter"
+
+target_name="local"
+if [[ "${is_local}" == false ]] && [[ "${from_file}" == false ]]; then
+  adb wait-for-device
+  is_adb_root && adb wait-for-device
+
+  do_stop_start=false
+
+  if [[ "${enable_gpu}" == true ]]; then
+    adb shell "echo 1 > ${adreno_perfcounter_file}"
+    adb push $($cygpathw ${host_gpu_counter_producer_filepath}) ${android_gpu_counter_producer_filepath} > "${verbose_err}"
+    adb shell chmod u+x ${android_gpu_counter_producer_filepath}
+    adb shell setprop debug.graphics.gpu.profiler.perfetto 1
+    if [[ "${enable_gpu_restart_services}" == true ]]; then
+      do_stop_start=true
+    fi
+    echo "GPU tracing is enabled."
+    echo ""
+    echo " --> Now restart the target app(s) and trace with --gpu1 or --gpu2 and/or --counters."
+    echo ""
+    echo "NOTE: CPU usage is slightly higher while GPU tracing is enabled, even while not tracing."
+  fi
+
+  if [[ "${disable_gpu}" == true ]]; then
+    adb shell setprop debug.graphics.gpu.profiler.perfetto 0
+    if [[ "${disable_gpu_restart_services}" == true ]]; then
+      do_stop_start=true
+    fi
+    echo "GPU tracing is disabled."
+  fi
+
+  if [[ "${disable_dynamic_policy}" == true ]]; then
+    orig_dyn_policy=$(adb shell getprop device_config.com_android_xr.com.android.xr.flags.enable_dynamic_policy)
+    adb shell setprop device_config.com_android_xr.com.android.xr.flags.enable_dynamic_policy false
+    if [[ "${orig_dyn_policy}" != false ]]; then
+      do_stop_start=true
+    fi
+    echo "Dynamic Policy is disabled. Reboot to reenable it."
+  fi
+
+  if [[ "${screen_timeout_ms}" != "0" ]]; then
+    echo "Set doff screen timeout to ${screen_timeout_ms} ms."
+    adb shell input keyevent KEYCODE_SLEEP
+    adb shell settings put system doff_screen_timeout_ms "${screen_timeout_ms}"
+    is_adb_root && adb shell setprop xr.disable_don_doff_sensor true
+    sleep 1
+    adb shell input keyevent KEYCODE_WAKEUP
+  fi
+
+  if [[ ! -z "${lock_head}" ]]; then
+    adb shell setprop cpm.fake_headtracking "${lock_head}"
+    adb shell setprop cpm.fake_het_position "0,0,0"
+    adb shell setprop cpm.fake_het_orientation "0,0,0,0"
+    do_stop_start=true
+  fi
+
+  if is_adb_root && [[ "${do_stop_start}" == true ]]; then
+    adb shell stop
+    sleep 1
+    adb shell start
+  fi
+
+  if [[ "${skip_tracing}" == true ]]; then
+    exit 0
+  fi
+
+  if [[ "${from_file}" == false ]]; then
+    target_name=$(adb shell getprop ro.product.model)
+    [[ -z "${target_name}" ]] &&
+      echo "error: no adb device" && exit 1
+    is_android=true
+  fi
+
+  if [[ "${target_name}" = *SM* ]]; then
+    include_android_thermal_config=true
+  fi
+
+  if [[ "${include_gpu2}" == true ]]; then
+    # There is a bug that causes all GPU events to be lost when the buffer fills
+    # up using the RING_BUFFER policy. So we force the DISCARD policy here.
+    fill_policy=DISCARD
+
+    if [[ "${target_name}" = *SM* ]]; then
+      gpu_perfetto_enabled=$(adb shell getprop debug.graphics.gpu.profiler.perfetto | tr -d '\r')
+      [[ ! "${gpu_perfetto_enabled}" == 1 ]] &&
+        echo "error: GPU tracing is not enabled." &&
+        echo "" &&
+        echo " --> Run xtrace --enable-gpu and then restart the target app" &&
+        exit 1
+    fi
+  fi
+
+  if [[ "${include_counters}" == true ]]; then
+    perfcounter=$(adb shell cat ${adreno_perfcounter_file} | tr -d '\r')
+    [[ ! "${perfcounter}" == 1 ]] &&
+      echo "error: GPU counters are not enabled" &&
+      echo "" &&
+      echo " --> Run xtrace --enable-gpu and then restart the target app" &&
+      exit 1
+    adb shell "nohup ${android_gpu_counter_producer_filepath} > /dev/null 2>&1 &"
+  fi
+else
+  is_android=false
+fi
+
+title_args+=("${target_name// /_}")
+
+# Enable builtin frame stats query.
+if [[ "${print_frame_stats}" == true ]] &&
+   [[ -z "${sql_path}" ]]; then
+  sql_path="${xtrace_dir}/queries/${gpu_stats_filename}"
+  auto_set_sql_path=true
+fi
+
+write_config_file() {
+  # Filter categories for atrace catgories.
+  atrace_categories=($(comm -12 \
+    <(echo "$(available_atrace_categories)" | tr ' ' '\n' | sort ) \
+    <(echo "${categories[@]}" | tr ' ' '\n' | sort)))
+
+  title_args+=("${categories[@]}")
+
+  # Perfetto added --version arg recently, which prints (eg):
+  #   "Perfetto v24.2-7cb228c16 (7cb228c16d69aee297a106ad3ccc7461fa0b8045)"
+  # Previous versions dump an error (hence 2>/dev/null below).
+  perfetto_version=$(adb shell perfetto --version 2>/dev/null)
+  perfetto_version_major="${perfetto_version#*v}"
+  perfetto_version_major="${perfetto_version_major%.*}"
+
+  if [[ "${include_gpu}" == true ]]; then
+    categories+=("gpu_profiling_service")
+    categories+=("gpu_surface_workload")
+  fi
+
+  if [[ "${include_gpu2}" == true ]]; then
+    categories+=("gpu_renderstage")
+  fi
+
+  # Write perfetto config file
+  # The long file_write_period_ms avoids writing to disk until the end.
+  cat >"${config_filepath}" <<EOL
+file_write_period_ms: 1000000000
+buffers {
+  size_kb: ${buffer_size_kb}
+  fill_policy: ${fill_policy}
+}
+buffers {
+  size_kb: 4000
+  fill_policy: DISCARD
+}
+incremental_state_config {
+  clear_period_ms: ${incremental_update_period_ms}
+}
+data_sources {
+  config {
+    name: "linux.process_stats"
+    target_buffer: 1
+    process_stats_config {
+      scan_all_processes_on_start: true
+EOL
+  if [[ "${categories[@]}" == *"memory" ]]; then
+    cat >>"${config_filepath}" <<EOL
+      proc_stats_poll_ms: 1000
+EOL
+  fi
+  cat >>"${config_filepath}" <<EOL
+    }
+  }
+}
+EOL
+
+  if [[ "${include_ftrace_defaults}" == true ]]; then
+    ftrace_events+=("sched/sched_process_free")
+    ftrace_events+=("task/task_newtask")
+    ftrace_events+=("task/task_rename")
+    ftrace_events+=("sched/sched_switch")
+    ftrace_events+=("power/suspend_resume")
+    ftrace_events+=("power/cpu_frequency")
+    ftrace_events+=("power/cpu_idle")
+    ftrace_events+=("sched/sched_wakeup")
+    ftrace_events+=("sched/sched_wakeup_new")
+    ftrace_events+=("sched/sched_waking")
+    ftrace_events+=("power/gpu_frequency")
+    ftrace_events+=("gpu_mem/gpu_mem_total")
+    ftrace_events+=("kmem/rss_stat")
+    ftrace_events+=("thermal/*")
+    ftrace_events+=("kgsl/gpu_frequency")
+    ftrace_events+=("kgsl/adreno_cmdbatch_sync")
+    ftrace_events+=("kgsl/adreno_cmdbatch_queued")
+    ftrace_events+=("kgsl/adreno_cmdbatch_submitted")
+    ftrace_events+=("kgsl/adreno_cmdbatch_retired")
+    ftrace_events+=("dcvsh/dcvsh_freq")
+    if [[ "${symbolize_ksyms}" == true ]]; then
+      ftrace_events+=("workqueue/*")
+    fi
+  fi
+
+  if [[ "${include_atrace_defaults}" == true ]]; then
+    # Note: gfx is off by default because it can cause compositor tearing.
+    atrace_categories+=("am")
+    atrace_categories+=("audio")
+    atrace_categories+=("hal")
+    atrace_categories+=("input")
+    atrace_categories+=("pm")
+    atrace_categories+=("power")
+    atrace_categories+=("res")
+    atrace_categories+=("rs")
+    atrace_categories+=("sm")
+    atrace_categories+=("video")
+    atrace_categories+=("view")
+    atrace_categories+=("wm")
+  fi
+
+  if [[ "${include_perfetto_defaults}" == true ]]; then
+    categories+=("cpm")
+    categories+=("aot")
+    categories+=("xrp")
+    categories+=("xr_input")
+  fi
+
+  cat >>"${config_filepath}" <<EOL
+data_sources {
+  config {
+    name: "linux.ftrace"
+    ftrace_config {
+      buffer_size_kb: 8192
+      drain_period_ms: 250
+      compact_sched {
+        enabled: true
+      }
+EOL
+
+  for (( i = 0; i < ${#atrace_apps[@]}; i++ ));
+  do
+    echo "      atrace_apps: \"${atrace_apps[${i}]}\"" >> \
+      "${config_filepath}"
+  done
+
+  for (( i = 0; i < ${#ftrace_events[@]}; i++ ));
+  do
+    echo "      ftrace_events: \"${ftrace_events[${i}]}\"" >> \
+      "${config_filepath}"
+  done
+
+  for (( i = 0; i < ${#atrace_categories[@]}; i++ ));
+  do
+    echo "      atrace_categories: \"${atrace_categories[${i}]}\"" >> \
+      "${config_filepath}"
+  done
+
+  if [[ ( "${perfetto_version_major}" -ge 34 ) ]]; then
+    cat >>"${config_filepath}" <<EOL
+      throttle_rss_stat: true
+EOL
+  fi
+
+  if [[ "${symbolize_ksyms}" == true ]]; then
+    cat >>"${config_filepath}" <<EOL
+      symbolize_ksyms: true
+EOL
+  fi
+
+  cat >>"${config_filepath}" <<EOL
+    }
+  }
+}
+EOL
+
+  cat >>"${config_filepath}" <<EOL
+data_sources {
+  config {
+    name: "linux.sys_stats"
+    sys_stats_config {
+EOL
+
+  if [[ ( "${perfetto_version_major}" -ge 24 ) ]]; then
+    cat >>"${config_filepath}" <<EOL
+      cpufreq_period_ms: 1000
+EOL
+  fi
+
+  cat >>"${config_filepath}" <<EOL
+      meminfo_period_ms: 10
+      meminfo_counters: MEMINFO_MEM_TOTAL
+      meminfo_counters: MEMINFO_MEM_FREE
+      meminfo_counters: MEMINFO_BUFFERS
+      meminfo_counters: MEMINFO_CACHED
+      meminfo_counters: MEMINFO_SWAP_CACHED
+    }
+  }
+}
+EOL
+
+  if [[ ( "${perfetto_version_major}" -ge 40 ) ]]; then
+    cat >>"${config_filepath}" <<EOL
+data_sources {
+  config {
+    name: "android.power"
+    android_power_config {
+      battery_poll_ms: 1000
+EOL
+    # For *SM* devices, collect power metrics from PMICs.
+    if [[ "${target_name}" = *SM* ]]; then
+      cat >>"${config_filepath}" <<EOL
+      pmic_update_location: "/sys/class/sec/max34427/update"
+      pmic_amperage_location: "/sys/class/sec/max34427/pwr_ch1"
+      pmic_voltage_location: "/sys/class/sec/max34427/vol_ch1"
+EOL
+    else
+      # For genernal devices, collect power metrics from battery counters.
+      cat >>"${config_filepath}" <<EOL
+      # Add battery counters to retrieve the power metrics.
+      battery_counters: BATTERY_COUNTER_CAPACITY_PERCENT
+      battery_counters: BATTERY_COUNTER_CHARGE
+      battery_counters: BATTERY_COUNTER_CURRENT
+      battery_counters: BATTERY_COUNTER_CURRENT_AVG
+      battery_counters: BATTERY_COUNTER_VOLTAGE
+      collect_power_rails: false
+      collect_energy_estimation_breakdown: false
+EOL
+     fi
+    cat >>"${config_filepath}" <<EOL
+    }
+  }
+}
+EOL
+  fi
+
+  cat >>"${config_filepath}" <<EOL
+data_sources {
+  config {
+    name: "track_event"
+    track_event_config {
+EOL
+
+  for (( i = 0; i < ${#categories[@]}; i++ ));
+  do
+    echo "      enabled_categories: \"${categories[${i}]}\"" >> \
+      "${config_filepath}"
+  done
+
+  for (( i = 0; i < ${#disabled_categories[@]}; i++ ));
+  do
+    echo "      disabled_categories: \"${disabled_categories[${i}]}\"" >> \
+      "${config_filepath}"
+  done
+  cat >>"${config_filepath}" <<EOL
+    }
+  }
+}
+EOL
+
+  if [[ "${include_gpu2}" == true ]]; then
+    cat >>"${config_filepath}" <<EOL
+data_sources {
+  config {
+    name: "gpu.renderstages"
+    gpu_renderstages_config {
+      full_loadstore: true
+      low_overhead: ${gpu2_low_overhead}
+    }
+  }
+}
+EOL
+  fi
+
+  # To work around adb piping data corruption, remove these when piping config:
+  if [[ "${push_config}" == true ]]; then
+    more_counter_ids=$(cat << EOF
+      counter_ids: 26
+EOF
+                    )
+  fi
+
+  if [[ "${include_counters}" == true ]]; then
+    cat >>"${config_filepath}" <<EOL
+data_sources {
+  config {
+    name: "gpu.counters"
+    gpu_counter_config {
+      counter_period_ns: 100000
+      counter_ids: 110
+${more_counter_ids}
+      counter_ids: 157
+      counter_ids: 29
+      counter_ids: 144
+      counter_ids: 3
+      counter_ids: 117
+      counter_ids: 116
+      counter_ids: 145
+      counter_ids: 146
+      counter_ids: 30
+      counter_ids: 156
+      counter_ids: 120
+      counter_ids: 129
+      counter_ids: 37
+      counter_ids: 147
+      counter_ids: 108
+      counter_ids: 111
+      counter_ids: 148
+      counter_ids: 149
+      counter_ids: 112
+      counter_ids: 154
+      counter_ids: 115
+      counter_ids: 133
+      counter_ids: 31
+      counter_ids: 1
+      counter_ids: 38
+      counter_ids: 21
+      counter_ids: 107
+      counter_ids: 128
+      counter_ids: 155
+      counter_ids: 158
+      counter_ids: 39
+    }
+  }
+}
+EOL
+  fi
+
+  if [[ "${include_vulkan}" == true ]]; then
+    cat >>"${config_filepath}" <<EOL
+data_sources {
+  config {
+    name: "VulkanCPUTiming"
+    legacy_config: "VkDevice:VkPhysicalDevice:VkInstance:VkQueue"
+  }
+}
+data_sources {
+  config {
+    name: "VulkanAPI"
+  }
+}
+EOL
+  fi
+
+  # To work around adb piping data corruption, remove these when piping config:
+  if [[ "${push_config}" == true ]]; then
+    more_log_ids=$(cat << EOF
+      log_ids: LID_EVENTS
+      log_ids: LID_CRASH
+EOF
+                )
+  fi
+
+  if [[ "${is_android}" == true ]]; then
+    cat >>"${config_filepath}" <<EOL
+data_sources {
+  config {
+    name: "android.log"
+    android_log_config {
+      min_prio: PRIO_VERBOSE
+      log_ids: LID_DEFAULT
+      log_ids: LID_SYSTEM
+${more_log_ids}
+    }
+  }
+}
+data_sources {
+  config {
+    name: "android.surfaceflinger.frametimeline"
+  }
+}
+EOL
+  fi
+
+  if [[ "${include_android_thermal_config}" == true ]]; then
+    cat >>"${config_filepath}" <<EOL
+data_sources: {
+  config {
+    name: "android.thermal"
+    android_thermal_config {
+      poll_ms: 300
+
+      sensors_sysfs: "/sys/class/sec/sec-lp-thermistor/temperature"
+      sensors_sysfs: "/sys/class/sec/sec-wf-thermistor/temperature"
+      sensors_sysfs: "/sys/class/sec/sec-ap-thermistor/temperature"
+      sensors_sysfs: "/sys/class/power_supply/battery/chg_temp"
+      sensors_sysfs: "/sys/class/power_supply/battery/batt_temp"
+      sensors_sysfs: "/sys/class/power_supply/battery/usb_temp"
+
+      sensors: "cpu-0-0-0"
+      sensors: "cpu-0-0-1"
+      sensors: "cpu-0-1-0"
+      sensors: "cpu-0-1-1"
+      sensors: "cpu-1-0-0"
+      sensors: "cpu-1-0-1"
+      sensors: "cpu-1-1-0"
+      sensors: "cpu-1-1-1"
+      sensors: "cpu-1-2-0"
+      sensors: "cpu-1-2-1"
+      sensors: "cpu-1-3-0"
+      sensors: "cpu-1-3-1"
+      sensors: "ddr"
+      sensors: "nspss-0"
+      sensors: "nspss-1"
+      sensors: "nspss-2"
+      sensors: "video"
+      sensors: "camera-0"
+      sensors: "camera-1"
+      sensors: "gpuss-0"
+      sensors: "gpuss-1"
+      sensors: "gpuss-2"
+      sensors: "gpuss-3"
+      sensors: "gpuss-4"
+      sensors: "gpuss-5"
+      sensors: "gpuss-6"
+      sensors: "gpuss-7"
+      sensors: "sys-therm-0"
+    }
+  }
+}
+EOL
+  fi
+
+  # Record chrome events.
+  if [[ ! -z "${chrome_categories}" ]] || [[ ! -z "${chrome_disabled_categories}" ]]; then
+    cat >>"${config_filepath}" <<EOL
+data_sources {
+  config {
+    name: "org.chromium.trace_event"
+    chrome_config {
+      trace_config: "{\"record_mode\":\"record-continuously\",\
+\"included_categories\":[${chrome_categories}],\
+\"excluded_categories\":[${chrome_disabled_categories}],\
+\"memory_dump_config\":{}}"
+      privacy_filtering_enabled: false
+    }
+  }
+}
+data_sources {
+  config {
+    name: "org.chromium.trace_metadata"
+    chrome_config {
+      trace_config: "{\"record_mode\":\"record-continuously\",\
+\"included_categories\":[${chrome_categories}],\
+\"excluded_categories\":[${chrome_disabled_categories}],\
+\"memory_dump_config\":{}}"
+      privacy_filtering_enabled: false
+    }
+  }
+}
+EOL
+  fi
+
+  if [[ "${is_local}" == true ]] && [[ "${time_ms}" != "0" ]]; then
+    echo "duration_ms: ${time_ms}" >> "${config_filepath}"
+  fi
+}
+
+if [[ "${is_local}" == true ]]; then
+
+  traced_running=$(ps --summary -W | grep traced)
+
+  if [[ -z "${traced_running}" ]]; then
+    echo "Starting trace service (traced) in background..."
+    echo "Wait a minute for the running app to connect to traced, or restart the app and then try again."
+    ${bg_bash} "${host_tools_dir}/traced &>/dev/null < /dev/null &"
+    exit 1
+  fi
+fi
+
+autoload () {
+  did_open=false
+  if [[ "${auto_open}" == true ]]; then
+    if [[ -z "${ui_sql_path}" ]] && [[ "${include_gpu}" == true ]] && [[ "${include_gpu2}" == false ]]; then
+      ui_sql_path="$($cygpathw ${kgsl_ui_sql_path})"
+      echo 'In the Perfetto Deeplink Query tab, click "Show debug track" -> "Show" to display GPU events'
+    fi
+    openscript="${xtrace_dir}/third_party/perfetto/open-trace.py";
+    if [[ -f "${openscript}" ]]; then
+      if [[ "${is_big}" == true ]]; then
+        echo "Starting trace_processor_shell and perfetto UI..."
+        echo ""
+        echo "This requires 'Relax Content Security Policy' to be enabled in perfetto UI flags."
+        echo "Follow the dialog if you don't have it enabled yet."
+        echo ""
+        # Get an unused port:
+        port=$(${python} -c '
+import socket
+sock = socket.socket()
+sock.bind(("127.0.0.1", 0))
+sockname = sock.getsockname()
+print(sockname[1])
+sock.close()')
+        version=$("${host_tools_dir}/trace_processor_shell" -v | grep Perfetto | awk '{print $2}')
+        # Adding version makes the UI match the perfetto binaries in third_party/perfetto.
+        address="https://ui.perfetto.dev/${version}/#!/?rpc_port=${port}"
+        echo "Wait for trace to load (look for \"Trace loaded\"), then open this link:"
+        echo ""
+        echo "    ----->   ${address}"
+        echo ""
+        # Launch trace_processor_shell on the trace file:
+        ${bg_bash} "${host_tools_dir}/trace_processor_shell -D --http-port ${port} \"${output_file}\"" &
+        did_open=true
+      else
+        if [[ -n "${ui_sql_path}" ]] && [[ ! -f "${ui_sql_path}" ]]; then
+          echo "error: file not found: ${ui_sql_path}"
+        fi
+        ${python} "$($cygpathw "${openscript}")" "${output_file}" "${ui_sql_path}" 2>/dev/null && did_open=true
+      fi
+    fi
+  fi
+
+  [[ "${did_open}" == false ]] && [[ -z "${sql_path}" ]] &&
+    echo "Open it at https://ui.perfetto.dev/"
+}
+
+run_trace_processor() {
+  if [[ "${verbose_sql_logs}" == true ]]; then
+    "${host_tools_dir}/trace_processor_shell" -q "$($cygpathw "${temp_sql_path}")" "${output_file}"
+  else
+    "${host_tools_dir}/trace_processor_shell" -q "$($cygpathw "${temp_sql_path}")" "${output_file}" \
+        2>/tmp/xtrace_trace_processor_shell.stderr
+    # Output sql errors to stderr but skip all the earlier output from trace_processor_shell.
+    sed -n -e '/Traceback/,$p' /tmp/xtrace_trace_processor_shell.stderr 1>&2
+  fi
+}
+
+run_sql_on () {
+  the_sql="$1"
+  if [[ -f "${the_sql}" ]]; then
+    echo "Processing trace query: ${the_sql}..."
+
+    temp_sql_path="/tmp/perfetto-query-${RANDOM}.sql"
+    cp "${the_sql}" "${temp_sql_path}"
+
+    # If we have a starting GPU frequency, inject it into the query for a more accurate average.
+    if [[ "${gpu_starting_freq_khz}" != 0 ]]; then
+      search_string="\\/\\* -- Optionally inject starting GPU frequency sample here -- \\*\\/"
+      replace_string="SELECT (SELECT MIN(ts) FROM ftrace_event) AS ts, ${gpu_starting_freq_khz} AS freq_khz UNION ALL"
+      if grep -q "${search_string}" "${temp_sql_path}"; then
+        verbose "injecting initial GPU frequency for query: ${gpu_starting_freq_khz}"
+        sed -i -e "s@${search_string}@${replace_string}@g" "${temp_sql_path}"
+      fi
+    fi
+
+    for (( i = 0; i < ${#custom_stats[@]}; i++ ));
+    do
+      verbose "  adding ${custom_stats[${i}]} to ${temp_sql_path}"
+      search_string="/\\* template stat insert \\*/"
+      replace_string="( SELECT AVG(dur) / 1000000.0 FROM thread_slice WHERE name LIKE '${custom_stats[${i}]}' AND upid = gpu_pids.upid ) AS '${custom_stats[${i}]}',${search_string}"
+      sed -i -e "s@${search_string}@${replace_string}@g" "${temp_sql_path}"
+    done
+
+    echo "================================================================================"
+
+    if [[ "${is_filtered_query_output}" == true ]]; then
+      run_trace_processor | sed 's/\"//g' | sed 's/\[NULL\]/-/g' | column -t -s,
+    else
+      run_trace_processor | grep .
+    fi
+  else
+    echo "error: sql query file not found: ${the_sql}"
+  fi
+}
+
+run_sql () {
+  if [[ -n "${sql_path}" ]]; then
+    run_sql_on "${sql_path}"
+  fi
+
+  if [[ "${print_cpu_top}" == true ]]; then
+    run_sql_on "${xtrace_dir}/queries/cpu_top.sql"
+  fi
+}
+
+if [[ "${from_file}" == true ]]; then
+  if [[ ! -f "${output_file}" ]]; then
+    echo "error: file not found: ${output_file}"
+    exit 1
+  fi
+
+  gpu_starting_freq_khz=$(grep --binary-files=text -E -o "phony_start_gpu_freq/.{0,6}" "${output_file}" | \
+                          sed 's/phony_start_gpu_freq\///')
+  if ! [[ "${gpu_starting_freq_khz}" =~ ^[0-9]+$ ]]; then # check if we got a number
+    gpu_starting_freq_khz=0
+  else
+    verbose "Found initial GPU frequency: ${gpu_starting_freq_khz}"
+  fi
+
+  run_sql
+
+  # Autoload by default if there was no explicitly set sql query.
+  if [[ -z "${sql_path}" ]] || [[ "${auto_set_sql_path}" == true ]]; then
+    autoload
+  fi
+
+  exit 0
+fi
+
+set_title() {
+  title_args=$(echo "${title_args[@]}" | tr ' ' '-')
+  if [[ ! -z "${output_args_file}" ]]; then
+    echo "${title_args}" > "${output_args_file}"
+  fi
+
+  if [[ -d "${output_file}" ]]; then
+    output_file=$($cygpathw "${output_file}/trace-${title_args}-${now}.perfetto")
+  elif [[ -z "${output_file}" ]]; then
+    output_file="./trace-${title_args}-${now}.perfetto"
+  fi
+
+  if [[ -f "${output_file}" ]]; then
+    rm "${output_file}"
+  fi
+  if touch "${output_file}"; then
+    rm "${output_file}"
+  else
+    echo "error: output file is not writable: ${output_file}"
+    exit 1
+  fi
+}
+
+if [[ "${is_local}" == false ]] && [[ "${lock_frequencies}" == true ]]; then
+  orig_dyn_policy=$(adb shell getprop device_config.com_android_xr.com.android.xr.flags.enable_dynamic_policy)
+  if [[ "${orig_dyn_policy}" != false ]]; then
+    echo "Warning: Dynamic Policy can override --lock-frequencies."
+    echo "         Run 'xtrace --disable-dynamic-policy' for more reliable results."
+  fi
+
+  # Disable SSRM
+  adb shell am broadcast -a com.salab.act.intent.SSRM --ez pmic_sensing_limit true > /dev/null 2>&1
+
+  gpu_level=5  # 599
+  cpu_freq=1920000
+  ddr_freq=2736
+
+  # Lock GPU frequency
+  orig_gpu_min_pwrlevel=$(adb shell cat /sys/class/kgsl/kgsl-3d0/min_pwrlevel)
+  orig_gpu_max_pwrlevel=$(adb shell cat /sys/class/kgsl/kgsl-3d0/max_pwrlevel)
+  adb shell "echo ${gpu_level} > /sys/class/kgsl/kgsl-3d0/min_pwrlevel"
+  adb shell "echo ${gpu_level} > /sys/class/kgsl/kgsl-3d0/max_pwrlevel"
+  adb shell "echo ${gpu_level} > /sys/class/kgsl/kgsl-3d0/min_pwrlevel"
+  adb shell "echo ${gpu_level} > /sys/class/kgsl/kgsl-3d0/max_pwrlevel"
+
+  # Lock CPU frequency
+  orig_cpu1_min=$(adb shell cat /sys/devices/system/cpu/cpufreq/policy0/scaling_min_freq)
+  orig_cpu1_max=$(adb shell cat /sys/devices/system/cpu/cpufreq/policy0/scaling_max_freq)
+  orig_cpu2_min=$(adb shell cat /sys/devices/system/cpu/cpufreq/policy2/scaling_min_freq)
+  orig_cpu2_max=$(adb shell cat /sys/devices/system/cpu/cpufreq/policy2/scaling_max_freq)
+  adb shell "echo ${cpu_freq} > /sys/devices/system/cpu/cpufreq/policy0/scaling_max_freq"
+  adb shell "echo ${cpu_freq} > /sys/devices/system/cpu/cpufreq/policy0/scaling_min_freq"
+  adb shell "echo ${cpu_freq} > /sys/devices/system/cpu/cpufreq/policy2/scaling_max_freq"
+  adb shell "echo ${cpu_freq} > /sys/devices/system/cpu/cpufreq/policy2/scaling_min_freq"
+
+  # Lock DDR frequency
+  if [[ -z "$(adb shell mount | grep debug)" ]]; then
+    # Mount debugfs if it's not already mounted
+    adb shell mount -t debugfs debugfs /sys/kernel/debug
+    if [[ $? -ne 0 ]]; then
+      echo "Error mounting debugfs: can't set ddr freq."
+    fi
+  fi
+  adb shell "echo \"{class: ddr, res: fixed, val: $((${ddr_freq} - 50))}\" > /sys/kernel/debug/aoss_send_message"
+
+  # Print frequencies
+  sleep 1
+  gpu_freq=$(($(adb shell cat /sys/class/kgsl/kgsl-3d0/devfreq/cur_freq) / 1000))
+  cpu1_freq=$(adb shell cat /sys/devices/system/cpu/cpufreq/policy0/scaling_cur_freq)
+  cpu2_freq=$(adb shell cat /sys/devices/system/cpu/cpufreq/policy2/scaling_cur_freq)
+  ddr_freq=$(($(adb shell cat /sys/kernel/debug/clk/measure_only_mccc_clk/clk_measure) / 1000))
+
+  echo "Lock frequencies: GPU:${gpu_freq} CPU:${cpu1_freq},${cpu2_freq} DDR:${ddr_freq}"
+fi
+
+# Capture starting GPU frequency.
+if [[ "${is_local}" == false ]]; then
+  raw_freq=$(adb shell cat /sys/class/kgsl/kgsl-3d0/devfreq/cur_freq 2> /dev/null | tr -d '\r' | tr -d ' ')
+  if [[ "$raw_freq" =~ ^[0-9]+$ ]]; then
+    gpu_starting_freq_khz=$((raw_freq / 1000))
+  else
+    gpu_starting_freq_khz=0
+  fi
+
+  # Inject a phony disabled category with the starting GPU frequency for later reference.
+  disabled_categories+=("phony_start_gpu_freq/${gpu_starting_freq_khz}")
+fi
+
+# Write config file.
+if [[ "${use_existing_config}" == true ]]; then
+  config_filebasename=$(basename "${config_filepath}")
+  # get filename without extension
+  config_filebasename=${config_filebasename%.*}
+  title_args+=("config_${config_filebasename}")
+else
+  write_config_file
+fi
+
+set_title
+
+verbose "Using config: ${config_filepath}"
+
+if [[ "${is_local}" == true ]]; then
+  if [[ "${time_ms}" == "0" ]]; then
+    echo "Press Ctrl-C to stop tracing..."
+  fi
+
+  "${perfetto}" -c "$($cygpathw $config_filepath)" --txt \
+      -o "${output_file}" > /dev/null || exit 1
+  du -hs "${output_file}"
+  autoload
+  exit 0
+fi
+
+if [[ "${use_binary_config}" == true ]]; then
+  "protoc" --encode=perfetto.protos.TraceConfig \
+          "--proto_path=$($cygpathw $(dirname $0))" \
+          "$($cygpathw $(dirname $0)/third_party/perfetto/perfetto_config.proto)" \
+          < "${config_filepath}" \
+          > "${config_filepath}.bin" \
+      || exit 1
+  config_filepath="${config_filepath}.bin"
+else
+  extra_args="--txt"
+fi
+
+android_config="/data/misc/perfetto-configs/config"
+android_trace="//data/misc/perfetto-traces/trace"
+
+# Stop old trace sessions and delete old trace files to avoid ownership errors.
+adb shell -x "pkill -x perfetto; rm -f ${android_trace}; " > /dev/null 2>&1
+
+# Kick off background perfetto trace.
+if adb push $($cygpathw ${config_filepath}) ${android_config} > /dev/null 2>&1 ; then
+  if ! perfetto_pid=$(adb shell perfetto -c ${android_config} "${extra_args}" \
+                    --background --o "${android_trace}" 2> ${verbose_err}); then
+    echo "perfetto error: try again with --verbose to see errors."
+    exit 1
+  fi
+else
+  [[ "${push_config}" == true ]] &&
+      echo "Warning: could not push config, so retry with --no-push-config if there are errors"
+  if ! perfetto_pid=$(adb shell perfetto -c - "${extra_args}" \
+                      --background --o "${android_trace}" < "${config_filepath}"); then
+    exit 1
+  fi
+fi
+
+perfetto_pid=$(echo "$perfetto_pid" | tr -d '\r')
+
+get_time_ns () {
+  # date +%s%N doesn't work on Mac.
+  perl -MTime::HiRes=time -e 'printf "%.0f\n", time * 1000000000'
+}
+
+cur_time_ns=$(get_time_ns)
+
+# Wait for timeout or interrupt.
+time_string='... press Ctrl-C to stop'
+[[ "${time_ms}" != "0" ]] && time_string=" for ${time_ms} ms..."
+[[ "${time_ms}" == "0" ]] && time_ms=$((24*60*60*1000)) # 24 hours by default.
+wait_ns="${time_ms}000000"
+end_time_ns=$((cur_time_ns + wait_ns))
+stop_waiting () { end_time_ns="${cur_time_ns}" ; }
+trap "echo ; stop_waiting" SIGINT
+trap "stop_waiting" SIGUSR1
+echo "Tracing ${target_name}${time_string}"
+# Note this sleep is intentionally short because parent script may
+# send us a SIGUSR1 that we only handle in between sleeps.
+while [[ ( $(get_time_ns) < "${end_time_ns}" ) ]]; do sleep 0.1; done
+trap - SIGINT SIGUSR1
+
+# Kill all perfetto processes and wait for them to finish.
+echo "Please wait: copying trace from ${target_name}..."
+
+# Wait for device in case it was unplugged during the trace.
+adb wait-for-device
+
+# Wait for trace completion.
+# Now using inotifyd instead of attach, to be sure the file is fully written.
+adb shell "inotifyd - ${android_trace}::w | head -n0 & kill ${perfetto_pid} ; wait ; \
+    pkill -x ${gpu_counter_producer}"
+
+adb pull ${android_trace} ${output_file} > /dev/null 2>&1 \
+    || { echo "error: failed to adb pull" ; exit 1; }
+du -hs "${output_file}"
+autoload
+
+if [[ "${screenshot}" == true ]]; then
+  echo "Capturing screenshot..."
+  previous_raw=$(adb shell getprop cpm.raw_capture)
+  is_adb_root && adb shell setprop cpm.raw_capture true
+  adb exec-out screencap -p > "${output_file}.png"
+  is_adb_root && [[ "${previous_raw}" != true ]] && adb shell setprop cpm.raw_capture false
+  du -hs "${output_file}.png"
+fi
+
+if [[ "${lock_frequencies}" == true ]]; then
+  # Restore previous frequencies.
+  adb shell "echo $orig_gpu_min_pwrlevel > /sys/class/kgsl/kgsl-3d0/min_pwrlevel"
+  adb shell "echo $orig_gpu_max_pwrlevel > /sys/class/kgsl/kgsl-3d0/max_pwrlevel"
+
+  adb shell "echo $orig_cpu1_max > /sys/devices/system/cpu/cpufreq/policy0/scaling_max_freq"
+  adb shell "echo $orig_cpu1_min > /sys/devices/system/cpu/cpufreq/policy0/scaling_min_freq"
+  adb shell "echo $orig_cpu2_max > /sys/devices/system/cpu/cpufreq/policy2/scaling_max_freq"
+  adb shell "echo $orig_cpu2_min > /sys/devices/system/cpu/cpufreq/policy2/scaling_min_freq"
+
+  adb shell "echo \"{class: ddr, res: fixed, val: 0}\" > /sys/kernel/debug/aoss_send_message"
+fi
+
+run_sql

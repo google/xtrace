@@ -1,0 +1,16 @@
+name: "Perfetto"
+description:
+    "Perfetto provides tools for processing trace data from devices and running "
+    "queries on the host."
+    ""
+
+third_party {
+  identifier {
+    type: "Archive"
+    value: "https://github.com/google/perfetto/releases/tag/v53.0"
+    primary_source: true
+    version: "v53.0"
+  }
+  version: "v53.0"
+  license_type: PERMISSIVE
+}
