@@ -360,61 +360,38 @@ gpu_dims AS (
     WHERE name = 'Surface'
     GROUP BY upid
 ),
-gpu_events_kgsl AS (
+gpu_events_pre AS (
     SELECT
-        upid, start_ts AS ts, active_dur AS dur, process AS name
+        upid, start_ts AS ts, active_dur AS dur
     FROM kgsl_gpu
-),
-gpu_events_gpu1 AS (
-    SELECT upid, ts, dur, name
-    FROM gpu_events_kgsl
+    WHERE process != '/system/bin/surfaceflinger'
     UNION ALL
-    /* --gpu1 events */
-    SELECT gs.upid, gs.ts, gs.dur, gs.name
-    FROM gpu_slice gs
-    LEFT JOIN gpu_events_kgsl existing_frames ON gs.upid = existing_frames.upid
-    WHERE
-        existing_frames.upid IS NULL
-        /* Workload is render, Dispatch is compute */
-        /* Both are separate from Preempt so we do not subtract Preempt events */
-        AND gs.name IN ('Workload', 'Dispatch')
-),
-gpu_events_compositor_upper_bound AS (
-    SELECT process_track.upid, ts, dur
+    /* compositor events */
+    SELECT
+        process_track.upid, ts,
+        /* if Real duration is 0, fall back on slice duration */
+        COALESCE(NULLIF(EXTRACT_ARG(arg_set_id, 'debug.Real duration'), 0), slice.dur) AS dur
     FROM slice
     JOIN process_track ON slice.track_id = process_track.id
     JOIN track ON slice.track_id = track.id
     WHERE (
         track.name = 'Compositor Timeline (Recorded)'
-        AND slice.name = 'GPU' AND category = 'cpm'
+        AND slice.name = 'GPU'
     )
-),
-gpu_events_compositor_preempt AS (
-    SELECT ts, dur
-    FROM gpu_slice
-    WHERE name = 'Preempt'
-),
-gpu_events_compositor_fallback AS (
-    SELECT
-        ub.upid,
-        /* If a valid preempt exists, use its ts, otherwise keep the upper bound ts */
-        COALESCE(p.ts, ub.ts) AS ts,
-        /* If a valid preempt exists, use its dur, otherwise keep the upper bound dur */
-        COALESCE(p.dur, ub.dur) AS dur
-    FROM gpu_events_compositor_upper_bound ub
-    LEFT JOIN gpu_events_compositor_preempt p
-        ON p.ts > ub.ts
-        AND p.ts < (ub.ts + ub.dur)
 ),
 gpu_events AS (
     SELECT upid, ts, dur
-    FROM gpu_events_gpu1
+    FROM gpu_events_pre
     UNION ALL
-    /* compositor fallback GPU events when kgsl not available */
-    SELECT fb.upid, fb.ts, fb.dur
-    FROM gpu_events_compositor_fallback fb
-    LEFT JOIN gpu_events_gpu1 existing_frames ON fb.upid = existing_frames.upid
-    WHERE existing_frames.upid IS NULL
+    /* --gpu1 events */
+    SELECT gs.upid, gs.ts, gs.dur
+    FROM gpu_slice gs
+    LEFT JOIN gpu_events_pre existing_frames ON gs.upid = existing_frames.upid
+    WHERE
+        existing_frames.upid IS NULL
+        /* Workload is render, Dispatch is compute */
+        /* Both are separate from Preempt so we do not subtract Preempt events */
+        AND gs.name IN ('Workload', 'Dispatch')
 ),
 cpu_frames_pre1 AS (
     /* CPM compositor frames */
