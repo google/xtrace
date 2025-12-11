@@ -40,8 +40,8 @@
 
 ## Common Usage
 
-> **Note:** Generally aim for traces of 10 seconds or less (\< 100 MB) to avoid a sluggish Perfetto
-> UI.
+> **Note:** Traces longer than 10 seconds may run out of buffer space in the default 200MB trace
+> buffer. Specify `-b 300000` for a 300MB buffer for example.
 
 ```shell
 # See all available options and usage info
@@ -69,7 +69,7 @@ xtrace -f my-trace.perfetto
 # Show average durations of slices matching "*updateView"
 xtrace -t 5s --avg "%updateView"
 
-# Record a 1-minute trace with a 300MB trace buffer (default is 140MB)
+# Record a 1-minute trace with a 300MB trace buffer
 xtrace -t 1m -b 300000
 ```
 

@@ -105,7 +105,7 @@ show_help_and_exit() {
   echo "  [-t <duration_ms>]       Duration to trace (default is until Ctrl-C). Also supports h/m/s suffix:"
   echo "                           Examples: \"1m5s\" (1 minute + 5 seconds) or \"300\" (300 ms)"
   echo "  [-o <output_file_or_dir>]  Write trace to a file or directory"
-  echo "  [-b <buffer_size_kb>]    Size of trace buffer in KB"
+  echo "  [-b <buffer_size_kb>]    Size of trace buffer in KB (default is ${buffer_size_kb})"
   echo "  [-p /path/to/perfetto]   Path to perfetto tool if it's not in \$PATH"
   echo "  [-c /path/to/config]     Use existing textproto config file instead of generating it"
   echo "  [-i <period_ms>]         Incremental update period in ms"
@@ -258,7 +258,7 @@ output_args_file=''
 title_args=()
 perfetto="${host_tools_dir}/perfetto"
 incremental_update_period_ms=1000
-buffer_size_kb=140000
+buffer_size_kb=200000
 fill_policy=RING_BUFFER
 verbose_logs=false
 verbose_err="/dev/null"
