@@ -541,8 +541,9 @@ process_thread_running_metrics AS (
             p.name process,
             t.name thread,
             t.tid tid,
-            min(priority) priority,
-            sum(dur / 1e6) dur_ms
+            /* AVG instead of MIN so we don't get arbitrary inherited priorities via rt-mutex. */
+            CAST(ROUND(AVG(priority), 0) AS INT) priority,
+            SUM(dur / 1e6) dur_ms
         FROM sched
         LEFT JOIN thread t USING (utid)
         LEFT JOIN process p USING (upid)
