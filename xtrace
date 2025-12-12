@@ -70,6 +70,7 @@ show_help_and_exit() {
   echo ""
   echo "Configure device tracing options:"
   echo "  (no tracing is done with these options)"
+  echo "  [--info]                 Print device build and GPU info"
   ecNR "  [--enable-gpu]           Enable GPU tracing on the device."
   ecNR "                           Note: Restart the app and then trace with --gpu1 or --gpu2."
   ecNR "  [--disable-gpu]          Disable GPU tracing on the device"
@@ -340,6 +341,10 @@ for (( i = 0; i < num_args; i++ )); do
   elif [[ "${args[${i}]}" = "--write-args" ]]; then
     i=$((i+1))
     output_args_file="${args[${i}]}"
+  elif [[ "${args[${i}]}" = "--info" ]]; then
+    adb shell getprop ro.build.description
+    adb shell dumpsys SurfaceFlinger | grep GLES
+    skip_tracing=true
   elif [[ "${args[${i}]}" = "--enable-gpu" ]]; then
     enable_gpu=true
     skip_tracing=true
