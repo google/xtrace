@@ -79,6 +79,7 @@ show_help_and_exit() {
   ecRT "  [--enable-gpu-no-stop]   Enable high-res GPU tracing (--gpu2) without restarting services"
   ecRT "  [--disable-gpu-no-stop]  Disable GPU tracing without restarting services"
   ecRT "  [--disable-dynamic-policy]  [XR] Disable dynamic policy and restart services"
+  ecRT "  [--disable-gpu-preemption]  [XR] Disable compositor preemption and restart services"
   ecRT "  [--lock-head]            [XR] Lock to a fake head pose"
   ecRT "  [--unlock-head]          [XR] Unlock the head pose"
   echo "  [--screen-timeout <ms>]  Set screen timeout and wake up the device. <ms> can be"
@@ -362,6 +363,9 @@ for (( i = 0; i < num_args; i++ )); do
   elif [[ "${args[${i}]}" = "--disable-dynamic-policy" ]]; then
     disable_dynamic_policy=true
     skip_tracing=true
+  elif [[ "${args[${i}]}" = "--disable-gpu-preemption" ]] && is_adb_root; then
+    disable_gpu_preemption=true
+    skip_tracing=true
   elif [[ "${args[${i}]}" = "--lock-head" ]]; then
     lock_head="1"
     skip_tracing=true
@@ -482,6 +486,14 @@ if [[ "${is_local}" == false ]] && [[ "${from_file}" == false ]]; then
       do_stop_start=true
     fi
     echo "Dynamic Policy is disabled. Reboot to reenable it."
+  fi
+
+  if [[ "${disable_gpu_preemption}" == true ]]; then
+    if [[ $(adb shell getprop compositor.high_priority) != 0 ]]; then
+      adb shell setprop compositor.high_priority 0
+      do_stop_start=true
+    fi
+    echo "Compositor GPU preemption is disabled. Reboot to reenable it."
   fi
 
   if [[ "${screen_timeout_ms}" != "0" ]]; then
