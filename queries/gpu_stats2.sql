@@ -360,6 +360,18 @@ gpu_dims AS (
     WHERE name = 'Surface'
     GROUP BY upid
 ),
+valid_comp_gpu_slices AS (
+    SELECT
+        process_track.upid,
+        slice.ts,
+        /* Turn 0 into NULL so AVG ignores it */
+        NULLIF(CAST(EXTRACT_ARG(arg_set_id, 'debug.Real duration') AS INT), 0) AS real_dur
+    FROM slice
+    JOIN process_track ON slice.track_id = process_track.id
+    JOIN track ON slice.track_id = track.id
+    WHERE track.name = 'Compositor Timeline (Recorded)'
+      AND slice.name = 'GPU'
+),
 gpu_events_pre AS (
     SELECT
         upid, start_ts AS ts, active_dur AS dur
@@ -368,16 +380,11 @@ gpu_events_pre AS (
     UNION ALL
     /* compositor events */
     SELECT
-        process_track.upid, ts,
-        /* if Real duration is 0, fall back on slice duration */
-        COALESCE(NULLIF(EXTRACT_ARG(arg_set_id, 'debug.Real duration'), 0), slice.dur) AS dur
-    FROM slice
-    JOIN process_track ON slice.track_id = process_track.id
-    JOIN track ON slice.track_id = track.id
-    WHERE (
-        track.name = 'Compositor Timeline (Recorded)'
-        AND slice.name = 'GPU'
-    )
+        upid,
+        ts,
+        /* Use the real duration; if NULL, use the average of all non-null durations */
+        CAST(COALESCE(real_dur, AVG(real_dur) OVER ()) AS INT) AS dur
+    FROM valid_comp_gpu_slices
 ),
 gpu_events AS (
     SELECT upid, ts, dur
