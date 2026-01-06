@@ -265,9 +265,8 @@ fill_policy=RING_BUFFER
 verbose_logs=false
 verbose_err="/dev/null"
 
-gpu_counter_producer="agi_launch_producer"
-android_gpu_counter_producer_filepath="/data/local/tmp/${gpu_counter_producer}"
-host_gpu_counter_producer_filepath="${xtrace_dir}/third_party/agi/${gpu_counter_producer}"
+# See /vendor/bin/gpu_counter_producer or /system/bin/gpu_counter_producer on supported devices.
+gpu_counter_producer="gpu_counter_producer"
 
 duration_to_ms() {
   local duration="$1"
@@ -458,8 +457,6 @@ if [[ "${is_local}" == false ]] && [[ "${from_file}" == false ]]; then
 
   if [[ "${enable_gpu}" == true ]]; then
     adb shell "echo 1 > ${adreno_perfcounter_file}"
-    adb push $($cygpathw ${host_gpu_counter_producer_filepath}) ${android_gpu_counter_producer_filepath} > "${verbose_err}"
-    adb shell chmod u+x ${android_gpu_counter_producer_filepath}
     adb shell setprop debug.graphics.gpu.profiler.perfetto 1
     if [[ "${enable_gpu_restart_services}" == true ]]; then
       do_stop_start=true
@@ -555,7 +552,7 @@ if [[ "${is_local}" == false ]] && [[ "${from_file}" == false ]]; then
       echo "" &&
       echo " --> Run xtrace --enable-gpu and then restart the target app" &&
       exit 1
-    adb shell "nohup ${android_gpu_counter_producer_filepath} > /dev/null 2>&1 &"
+    adb shell "nohup ${gpu_counter_producer} > /dev/null 2>&1 &"
   fi
 else
   is_android=false
