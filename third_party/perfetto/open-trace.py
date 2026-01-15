@@ -18,6 +18,7 @@
 # https://github.com/google/perfetto/blob/master/tools/record_android_trace
 
 import http.server
+import json
 import os
 import socketserver
 import sys
@@ -51,7 +52,11 @@ def get_query_string():
   if len(sys.argv) <= 2 or not sys.argv[2] or sys.argv[2].isspace():
     return ""
   with open(sys.argv[2], 'r') as sql:
-    return "&query=" + quote(sql.read())
+    text = sql.read()
+    if text[0] == '[':
+      return "&startupCommands=" + quote(text)
+    else:
+      return "&query=" + quote(text)
 
 def main():
   open_trace_in_browser(sys.argv[1], True, 'https://ui.perfetto.dev', get_query_string())

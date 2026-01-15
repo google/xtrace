@@ -122,7 +122,7 @@ show_help_and_exit() {
   ecRT "  [--gpu]                  Include kgsl ftrace GPU data (on by default)"
   echo "  [--gpu1]                 Include GPU slice events and GPU frame stats"
   echo "  [--gpu2]                 Include detailed GPU events (has significant GPU overhead)"
-  echo "  [--counters]             Include GPU counters"
+  echo "  [--counters]             Include GPU counters (combine with --gpu2 for best results)"
   echo "  [--vk]                   Include Vulkan API tracing"
   echo "  [--no-ftrace]            Do not include common ftrace data"
   echo "  [--no-atrace]            Do not include common atrace categories"
@@ -140,6 +140,7 @@ show_help_and_exit() {
   echo "Examples:"
   echo "  xtrace                           Trace adb device until Ctrl-C"
   echo "  xtrace -t 1s                     Trace for 1 second"
+  echo "  xtrace --gpu2 --counters         Trace detailed GPU events and counters"
   echo "  xtrace gfx                       Include gfx category (disabled-by-default)"
   echo '  xtrace -d "*" wm gfx             Only trace wm and gfx'
   echo "  xtrace -f ./trace                Open ./trace in browser"
@@ -203,6 +204,8 @@ else
   host_tools_dir="${xtrace_dir}/third_party/perfetto/linux-amd64"
 fi
 
+data_dir="${xtrace_dir}/data/adreno"
+
 if [[ "${os}" = "Msys" ]]; then
   cygpathw='cygpath -w'
 else
@@ -224,6 +227,8 @@ skip_tracing=false
 include_gpu=false
 include_gpu2=false
 gpu2_low_overhead=false
+include_counters=false
+include_renderstage_counters=false
 include_android_thermal_config=false
 sql_path=''
 auto_set_sql_path=false
@@ -267,6 +272,10 @@ verbose_err="/dev/null"
 
 # See /vendor/bin/gpu_counter_producer or /system/bin/gpu_counter_producer on supported devices.
 gpu_counter_producer="gpu_counter_producer"
+gpu_trace_metrics_path="${data_dir}/all_gpu_trace_metrics.list"
+ui_gpu1_cmds_path="${data_dir}/ui_gpu1.cmds"
+ui_gpu2_cmds_path="${data_dir}/ui_gpu2.cmds"
+ui_kgsl_cmds_path="${data_dir}/ui_kgsl.cmds"
 
 duration_to_ms() {
   local duration="$1"
@@ -441,6 +450,16 @@ for (( i = 0; i < num_args; i++ )); do
     fi
   fi
 done
+
+# If counters are requested, switch to renderstage mode if also using --gpu2.
+if [[ "${include_counters}" == true ]]; then
+  if [[ "${include_gpu2}" == true ]] && [[ "${gpu2_low_overhead}" == false ]]; then
+    include_counters=false
+    include_renderstage_counters=true
+  else
+    echo "Note: Use --gpu2 with --counters to align counter data with GPU workloads."
+  fi
+fi
 
 # Strip trailing comma:
 chrome_categories="${chrome_categories%","}"
@@ -813,6 +832,15 @@ data_sources {
     gpu_renderstages_config {
       full_loadstore: true
       low_overhead: ${gpu2_low_overhead}
+EOL
+    if [[ "${include_renderstage_counters}" == true ]]; then
+      sed -e 's/\r//g' -e 's/^/      trace_metrics: "/' -e 's/$/"/' "${gpu_trace_metrics_path}" >> \
+        "${config_filepath}"
+    else
+      # Need an empty trace_metrics to overwrite the previous trace_metrics settings.
+      echo "      trace_metrics: \"\"" >> "${config_filepath}"
+    fi
+    cat >>"${config_filepath}" <<EOL
     }
   }
 }
@@ -833,7 +861,7 @@ data_sources {
   config {
     name: "gpu.counters"
     gpu_counter_config {
-      counter_period_ns: 100000
+      counter_period_ns: 100000000
       counter_ids: 110
 ${more_counter_ids}
       counter_ids: 157
@@ -1018,10 +1046,18 @@ fi
 autoload () {
   did_open=false
   if [[ "${auto_open}" == true ]]; then
-    if [[ -z "${ui_sql_path}" ]] && [[ "${include_gpu}" == true ]] && [[ "${include_gpu2}" == false ]]; then
-      ui_sql_path="$($cygpathw ${kgsl_ui_sql_path})"
-      echo 'In the Perfetto Deeplink Query tab, click "Show debug track" -> "Show" to display GPU events'
+    if [[ -z "${ui_sql_path}" ]]; then
+      if [[ "${include_gpu}" == true ]] && [[ "${include_gpu2}" == false ]]; then
+        ui_sql_path="$($cygpathw ${ui_kgsl_cmds_path})"
+      fi
+      if [[ "${include_gpu2}" == true ]] && [[ "${gpu2_low_overhead}" == true ]]; then
+        ui_sql_path="$($cygpathw ${ui_gpu1_cmds_path})"
+      fi
+      if [[ "${include_gpu2}" == true ]] && [[ "${gpu2_low_overhead}" == false ]]; then
+        ui_sql_path="$($cygpathw ${ui_gpu2_cmds_path})"
+      fi
     fi
+
     openscript="${xtrace_dir}/third_party/perfetto/open-trace.py";
     if [[ -f "${openscript}" ]]; then
       if [[ "${is_big}" == true ]]; then

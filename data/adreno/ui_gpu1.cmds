@@ -1,0 +1,6 @@
+[
+    {
+        "id": "dev.perfetto.PinTracksByRegex",
+        "args": [".*GPU Queue [0-3].*"]
+    }
+]
