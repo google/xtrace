@@ -95,6 +95,10 @@ show_help_and_exit() {
   echo "  [--verbose-sql-logs]     Show verbose perfetto trace parsing logs during SQL query"
   echo "  [--frame-stats]          Print frame stats (on by default)"
   echo "  [--no-frame-stats]       Do not print frame stats"
+  echo "  [--counter-stats]        Print detailed GPU counter stats for a target process and surface."
+  echo "                           Usage: --counter-stats[=<app_name>,<surface_index>/<total_surfaces>]"
+  echo "                           Examples: --counter-stats=com.company.app,1/2 or --counter-stats=2/2"
+  echo "                           --counter-stats alone auto-selects the most costly GPU surface."
   echo "  [--top]                  Print the top CPU usage by process"
   echo "  [--no-open]              Do not open the trace in the browser"
   echo "  [--verbose]              Print verbose output"
@@ -231,11 +235,12 @@ include_counters=false
 include_renderstage_counters=false
 include_android_thermal_config=false
 sql_path=''
-auto_set_sql_path=false
 ui_sql_path=""
 gpu_stats_filename="gpu_stats2.sql"
 custom_stats=()
 print_frame_stats=true
+print_surface_stats=false
+print_gpu_counter_stats=false
 print_cpu_top=false
 gpu_starting_freq_khz=0
 is_filtered_query_output=true
@@ -333,6 +338,13 @@ for (( i = 0; i < num_args; i++ )); do
     print_frame_stats=true
   elif [[ "${args[${i}]}" = "--no-frame-stats" ]]; then
     print_frame_stats=false
+  elif [[ "${args[${i}]}" == "--surface-stats" ]]; then
+    print_surface_stats=true
+  elif [[ "${args[${i}]}" == --counter-stats* ]]; then
+    print_gpu_counter_stats=true
+    if [[ "${args[${i}]}" == *=* ]]; then
+      gpu_counter_stats_filter="${args[${i}]#*=}"
+    fi
   elif [[ "${args[${i}]}" = "--avg" ]]; then
     i=$((i+1))
     custom_stats+=("${args[${i}]}")
@@ -574,13 +586,6 @@ else
 fi
 
 title_args+=("${target_name// /_}")
-
-# Enable builtin frame stats query.
-if [[ "${print_frame_stats}" == true ]] &&
-   [[ -z "${sql_path}" ]]; then
-  sql_path="${xtrace_dir}/queries/${gpu_stats_filename}"
-  auto_set_sql_path=true
-fi
 
 write_config_file() {
   # Filter categories for atrace catgories.
@@ -1087,29 +1092,36 @@ sock.close()')
         ${python} "$($cygpathw "${openscript}")" "${output_file}" "${ui_sql_path}" 2>/dev/null && did_open=true
       fi
     fi
-  fi
 
-  [[ "${did_open}" == false ]] && [[ -z "${sql_path}" ]] &&
-    echo "Open it at https://ui.perfetto.dev/"
+    [[ "${did_open}" == false ]] && [[ -z "${sql_path}" ]] &&
+      echo "Open it at https://ui.perfetto.dev/"
+  fi
 }
 
 run_trace_processor() {
   if [[ "${verbose_sql_logs}" == true ]]; then
-    "${host_tools_dir}/trace_processor_shell" -q "$($cygpathw "${temp_sql_path}")" "${output_file}"
+    "${host_tools_dir}/trace_processor_shell" -q "$($cygpathw "$1")" "${output_file}"
   else
-    "${host_tools_dir}/trace_processor_shell" -q "$($cygpathw "${temp_sql_path}")" "${output_file}" \
+    "${host_tools_dir}/trace_processor_shell" -q "$($cygpathw "$1")" "${output_file}" \
         2>/tmp/xtrace_trace_processor_shell.stderr
     # Output sql errors to stderr but skip all the earlier output from trace_processor_shell.
     sed -n -e '/Traceback/,$p' /tmp/xtrace_trace_processor_shell.stderr 1>&2
   fi
 }
 
-run_sql_on () {
-  the_sql="$1"
-  if [[ -f "${the_sql}" ]]; then
-    echo "Processing trace query: ${the_sql}..."
+sql_output=""
 
-    temp_sql_path="/tmp/perfetto-query-${RANDOM}.sql"
+run_sql_on () {
+  local the_sql="$1"
+  local title="$2"
+  if [[ -f "${the_sql}" ]]; then
+    if [[ -z "${title}" ]]; then
+      title="${the_sql}"
+    fi
+    echo ""
+    echo "Processing ${title}..."
+
+    local temp_sql_path="/tmp/perfetto-query-${RANDOM}.sql"
     cp "${the_sql}" "${temp_sql_path}"
 
     # If we have a starting GPU frequency, inject it into the query for a more accurate average.
@@ -1130,16 +1142,108 @@ run_sql_on () {
       sed -i -e "s@${search_string}@${replace_string}@g" "${temp_sql_path}"
     done
 
-    echo "================================================================================"
-
     if [[ "${is_filtered_query_output}" == true ]]; then
-      run_trace_processor | sed 's/\"//g' | sed 's/\[NULL\]/-/g' | column -t -s,
+      sql_output=$(run_trace_processor "${temp_sql_path}" | sed 's/\"//g' | sed 's/\[NULL\]/-/g' | sed '/^$/d')
+      sql_print=$(echo "${sql_output}" | column -s, -t)
     else
-      run_trace_processor | grep .
+      sql_output=$(run_trace_processor "${temp_sql_path}" | sed '/^$/d')
+      sql_print="${sql_output}"
     fi
+
+    local first_line=$(head -n 1 <<< "${sql_print}")
+    local dash_line=""
+    printf -v dash_line '%*s' "${#first_line}" ''
+    dash_line=${dash_line// /-}
+    echo "${dash_line}"
+    echo "${sql_print}"
   else
     echo "error: sql query file not found: ${the_sql}"
   fi
+}
+
+surface_stats_output=""
+
+run_surface_sql() {
+  if [[ -n "${surface_stats_output}" ]]; then
+    return
+  fi
+  run_sql_on "${xtrace_dir}/queries/surface_stats.sql" "--surface-stats"
+  surface_stats_output="${sql_output}"
+}
+
+run_counters_sql () {
+  local temp_sql_path="/tmp/gpu2_counters-${RANDOM}.sql"
+  cp "${xtrace_dir}/queries/gpu2_counters.sql" "${temp_sql_path}"
+  local counter_stats_title="--counter-stats"
+
+  if [[  -z "${gpu_counter_stats_filter}" ]]; then
+    run_surface_sql
+    read top_proc top_index <<< $(echo "${surface_stats_output}" | awk -F, '
+      NR==1 {
+        for(i=1;i<=NF;i++) {
+          if($i=="ProcessName") proc_idx=i;
+          if($i=="SurfaceID") idx_idx=i;
+        }
+      }
+      NR>1 && proc_idx && $proc_idx != "" {
+        print $proc_idx, $idx_idx; exit
+      }
+    ')
+
+
+    if [[ -n "${top_proc}" ]]; then
+      gpu_counter_stats_filter="${top_proc},${top_index}"
+      if (( $(echo "${surface_stats_output}" | wc -l) > 2 )); then
+        counter_stats_title="--counter-stats=${gpu_counter_stats_filter}"
+      fi
+    else
+      echo "Warning: No GPU Surface events found."
+    fi
+  fi
+
+  if [[ -n "${gpu_counter_stats_filter}" ]]; then
+    sql_filter=""
+    if [[ "${gpu_counter_stats_filter}" == *,* ]]; then
+      # eg: --counter-stats=com.company.app,1/2
+      app_pattern="${gpu_counter_stats_filter%,*}"
+      idx_pattern="${gpu_counter_stats_filter#*,}"
+    elif [[ "${gpu_counter_stats_filter}" == */* ]]; then
+      # eg: --counter-stats=1/2
+      app_pattern=""
+      idx_pattern="${gpu_counter_stats_filter}"
+    else
+      # eg: --counter-stats=com.company.app
+      app_pattern="${gpu_counter_stats_filter}"
+      idx_pattern=""
+    fi
+
+    if [[ -n "${app_pattern}" ]]; then
+      # SQLite GLOB uses * for wildcards, not %. Strip any % the user might have passed.
+      app_pattern="${app_pattern//%/}"
+      # Ensure it has exactly one * at the start and end
+      app_pattern="*${app_pattern#\*}"
+      app_pattern="${app_pattern%\*}*"
+      sql_filter+=" AND EXTRACT_ARG(arg_set_id, 'description') GLOB '${app_pattern}' "
+    fi
+
+    if [[ -n "${idx_pattern}" ]]; then
+      idx="${idx_pattern%/*}"
+      total="${idx_pattern#*/}"
+      idx=$((idx - 1))
+      sql_filter+=" AND EXTRACT_ARG(arg_set_id, 'name') GLOB 'Surface *' AND CAST(SUBSTR(EXTRACT_ARG(arg_set_id, 'name'), 9) AS INT) % ${total} = (${idx}%${total}) "
+    fi
+
+    search_string="\\/\\* template surface filter \\*\\/"
+    sed -i -e "s@${search_string}@${sql_filter}@g" "${temp_sql_path}"
+
+    search_string="\\/\\* template filter active \\*\\/ 0 = 0"
+    sed -i -e "s@${search_string}@1 = 0@g" "${temp_sql_path}"
+
+    search_string="\\/\\* template target filter processing \\*\\/ name IN ('Binning', 'Render', 'Dispatch', 'Compute')"
+    sed -i -e "s@${search_string}@name = 'Surface' ${sql_filter}@g" "${temp_sql_path}"
+  fi
+
+  run_sql_on "${temp_sql_path}" "${counter_stats_title}"
 }
 
 run_sql () {
@@ -1147,8 +1251,21 @@ run_sql () {
     run_sql_on "${sql_path}"
   fi
 
+  # Enable builtin frame stats query.
+  if [[ "${print_frame_stats}" == true ]]; then
+    run_sql_on "${xtrace_dir}/queries/${gpu_stats_filename}" "--frame-stats"
+  fi
+
   if [[ "${print_cpu_top}" == true ]]; then
-    run_sql_on "${xtrace_dir}/queries/cpu_top.sql"
+    run_sql_on "${xtrace_dir}/queries/cpu_top.sql" "--cpu-top"
+  fi
+
+  if [[ "${print_surface_stats}" == true ]]; then
+    run_surface_sql
+  fi
+
+  if [[ "${print_gpu_counter_stats}" == true ]]; then
+    run_counters_sql
   fi
 }
 
@@ -1169,7 +1286,7 @@ if [[ "${from_file}" == true ]]; then
   run_sql
 
   # Autoload by default if there was no explicitly set sql query.
-  if [[ -z "${sql_path}" ]] || [[ "${auto_set_sql_path}" == true ]]; then
+  if [[ -z "${sql_path}" ]]; then
     autoload
   fi
 
