@@ -514,10 +514,7 @@ if [[ "${is_local}" == false ]] && [[ "${from_file}" == false ]]; then
 
   if [[ "${screen_timeout_ms}" != "0" ]]; then
     echo "Set doff screen timeout to ${screen_timeout_ms} ms."
-    adb shell input keyevent KEYCODE_SLEEP
     adb shell settings put system doff_screen_timeout_ms "${screen_timeout_ms}"
-    is_adb_root && adb shell setprop xr.disable_don_doff_sensor true
-    sleep 1
     adb shell input keyevent KEYCODE_WAKEUP
   fi
 
