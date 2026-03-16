@@ -234,7 +234,6 @@ sql_path=''
 auto_set_sql_path=false
 ui_sql_path=""
 gpu_stats_filename="gpu_stats2.sql"
-kgsl_ui_sql_path="${xtrace_dir}/queries/kgsl_gpu_events_for_ui.sql"
 custom_stats=()
 print_frame_stats=true
 print_cpu_top=false
