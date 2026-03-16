@@ -1362,8 +1362,16 @@ inotify_setup='inotify_suffix="::w"; [[ $(getprop ro.build.version.release) -ge 
 adb shell "${inotify_setup}; inotifyd - ${android_trace}\$inotify_suffix | head -n0 & kill ${perfetto_pid} ; wait ; \
     pkill -x ${gpu_counter_producer}"
 
-adb pull ${android_trace} ${output_file} > /dev/null 2>&1 \
-    || { echo "error: failed to adb pull" ; exit 1; }
+if ! adb pull ${android_trace} ${output_file} > /dev/null 2>&1; then
+  sleep 1
+  adb wait-for-device
+  if ! adb pull ${android_trace} ${output_file}; then
+    sleep 1
+    adb wait-for-device
+    adb pull ${android_trace} ${output_file} \
+        || { echo "error: failed to adb pull ${android_trace} ${output_file}" ; exit 1; }
+  fi
+fi
 du -hs "${output_file}"
 autoload
 
