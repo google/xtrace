@@ -273,6 +273,7 @@ buffer_size_kb=200000
 fill_policy=RING_BUFFER
 verbose_logs=false
 verbose_err="/dev/null"
+is_quiet=false
 
 # See /vendor/bin/gpu_counter_producer or /system/bin/gpu_counter_producer on supported devices.
 gpu_counter_producer="gpu_counter_producer"
@@ -289,6 +290,12 @@ duration_to_ms() {
 
 verbose() {
   if [[ "${verbose_logs}" == true ]]; then
+    echo "$1"
+  fi
+}
+
+notquiet() {
+  if [[ "${is_quiet}" == false ]]; then
     echo "$1"
   fi
 }
@@ -426,6 +433,8 @@ for (( i = 0; i < num_args; i++ )); do
     title_args+=("atrace-apps")
   elif [[ "${args[${i}]}" = "--no-open" ]]; then
     auto_open=false
+  elif [[ "${args[${i}]}" = "--quiet" ]]; then
+    is_quiet=true
   elif [[ "${args[${i}]}" = "--verbose" ]]; then
     verbose_logs=true
     verbose_err="/dev/stderr"
@@ -1118,8 +1127,8 @@ run_sql_on () {
     if [[ -z "${title}" ]]; then
       title="${the_sql}"
     fi
-    echo ""
-    echo "Processing ${title}..."
+    notquiet ""
+    notquiet "Processing ${title}..."
 
     local temp_sql_path="/tmp/perfetto-query-${RANDOM}.sql"
     cp "${the_sql}" "${temp_sql_path}"
@@ -1154,7 +1163,7 @@ run_sql_on () {
     local dash_line=""
     printf -v dash_line '%*s' "${#first_line}" ''
     dash_line=${dash_line// /-}
-    echo "${dash_line}"
+    notquiet "${dash_line}"
     echo "${sql_print}"
   else
     echo "error: sql query file not found: ${the_sql}"
