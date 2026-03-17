@@ -95,10 +95,14 @@ show_help_and_exit() {
   echo "  [--verbose-sql-logs]     Show verbose perfetto trace parsing logs during SQL query"
   echo "  [--frame-stats]          Print frame stats (on by default)"
   echo "  [--no-frame-stats]       Do not print frame stats"
+  echo "  [--surface-stats]        Print GPU surface stats"
+  echo "  [--no-surface-stats]     Do not print GPU surface stats"
   echo "  [--counter-stats]        Print detailed GPU counter stats for a target process and surface."
+  echo "                           This requires a trace with --gpu2 --counters."
   echo "                           Usage: --counter-stats[=<app_name>,<surface_index>/<total_surfaces>]"
   echo "                           Examples: --counter-stats=com.company.app,1/2 or --counter-stats=2/2"
-  echo "                           --counter-stats alone auto-selects the most costly GPU surface."
+  echo "                             --counter-stats alone auto-selects the most costly GPU surface"
+  echo "  [--no-counter-stats]     Do not print GPU counter stats"
   echo "  [--top]                  Print the top CPU usage by process"
   echo "  [--no-open]              Do not open the trace in the browser"
   echo "  [--verbose]              Print verbose output"
@@ -240,6 +244,7 @@ gpu_stats_filename="gpu_stats2.sql"
 custom_stats=()
 print_frame_stats=true
 print_surface_stats=false
+suppress_surface_stats=false
 print_gpu_counter_stats=false
 print_cpu_top=false
 gpu_starting_freq_khz=0
@@ -262,6 +267,8 @@ now=$(date +"%Y-%m-%d_%H-%M-%S")
 from_file=false
 is_big=false
 output_file=''
+trace_input_files=()
+is_compare=false
 config_filename="perfetto-${RANDOM}.config"
 config_filepath="/tmp/${config_filename}"
 use_existing_config=false
@@ -300,6 +307,14 @@ notquiet() {
   fi
 }
 
+# Print dashed line matching length of first line of $1
+dashed_header_line() {
+  local first_line=$(head -n 1 <<< "$1")
+  local dash_line=""
+  printf -v dash_line '%*s' "${#first_line}" ''
+  notquiet "${dash_line// /-}"
+}
+
 # Parse args
 args=("$@")
 
@@ -315,9 +330,12 @@ for (( i = 0; i < num_args; i++ )); do
     fill_policy=DISCARD
   elif [[ "${args[${i}]}" = "--big" ]]; then
     is_big=true
+  elif [[ "${args[${i}]}" = "--compare" ]]; then
+    is_compare=true
   elif [[ "${args[${i}]}" = "-f" ]]; then
     i=$((i+1))
     output_file=$($cygpathw "${args[${i}]}")
+    trace_input_files+=("${output_file}")
     from_file=true
   elif [[ "${args[${i}]}" = "-o" ]]; then
     i=$((i+1))
@@ -347,6 +365,8 @@ for (( i = 0; i < num_args; i++ )); do
     print_frame_stats=false
   elif [[ "${args[${i}]}" == "--surface-stats" ]]; then
     print_surface_stats=true
+  elif [[ "${args[${i}]}" == "--no-surface-stats" ]]; then
+    suppress_surface_stats=true
   elif [[ "${args[${i}]}" == --counter-stats* ]]; then
     print_gpu_counter_stats=true
     if [[ "${args[${i}]}" == *=* ]]; then
@@ -479,11 +499,73 @@ if [[ "${include_counters}" == true ]]; then
   else
     echo "Note: Use --gpu2 with --counters to align counter data with GPU workloads."
   fi
+  if [[ "${include_gpu2}" == true ]]; then
+    # Enable counter stats by default with --gpu2 --counters.
+    print_gpu_counter_stats=true
+  fi
 fi
 
 # Strip trailing comma:
 chrome_categories="${chrome_categories%","}"
 chrome_disabled_categories="${chrome_disabled_categories%","}"
+
+if [[ "${is_compare}" == true ]]; then
+  if [[ "${#trace_input_files[@]}" -lt 2 ]]; then
+    echo "error: --compare requires at least two -f traces."
+    exit 1
+  fi
+
+  # Build the argument list for sub-calls to xtrace for each trace file.
+  compare_counter_stats=()
+  for (( i = 0; i < num_args; i++ )); do
+    arg="${args[$i]}"
+    if [[ "${arg}" == --counter-stats* ]]; then
+      compare_counter_stats+=("${arg}")
+    fi
+  done
+
+  compare_args=("--no-frame-stats" "--no-surface-stats" "--no-open" "--quiet" "--csv-output")
+
+  csv_files=()
+  for (( idx = 0; idx < ${#trace_input_files[@]}; idx++ )); do
+    file="${trace_input_files[$idx]}"
+    csv_file="/tmp/xtrace_compare_${RANDOM}_$$.csv"
+    c_stat="--counter-stats"
+    if [[ "${#compare_counter_stats[@]}" -gt 0 ]]; then
+      if [[ "${idx}" -lt "${#compare_counter_stats[@]}" ]]; then
+        c_stat="${compare_counter_stats[$idx]}"
+      else
+        c_stat="${compare_counter_stats[${#compare_counter_stats[@]}-1]}"
+      fi
+    fi
+
+    csv_files+=($($cygpathw "${csv_file}"))
+
+    notquiet "Processing $((idx+1)): ${file}..."
+    "${0}" "${compare_args[@]}" "${c_stat}" -f "${file}" > "${csv_file}" 2> "${csv_file}.err" &
+  done
+
+  wait
+
+  # Print error logs (if any)
+  for (( idx = 0; idx < ${#trace_input_files[@]}; idx++ )); do
+    file="${trace_input_files[$idx]}"
+    error_log=$(cat "${csv_files[$idx]}.err")
+    if [[ -n "${error_log}" ]]; then
+      echo "Note with ($((idx+1))) ${file}:"
+      echo "${error_log}"
+    fi
+  done
+
+  python_script=$($cygpathw "${xtrace_dir}/scripts/compare_counters.py")
+  compare_output=$(${python} "${python_script}" "${trace_input_files[@]}" "--" "${csv_files[@]}")
+
+  dashed_header_line "${compare_output}"
+  echo "${compare_output}"
+
+  exit 0
+fi
+
 
 adreno_perfcounter_file="/sys/class/kgsl/kgsl-3d0/perfcounter"
 
@@ -1096,7 +1178,7 @@ sock.close()')
         did_open=true
       else
         if [[ -n "${ui_sql_path}" ]] && [[ ! -f "${ui_sql_path}" ]]; then
-          echo "error: file not found: ${ui_sql_path}"
+          echo "error: file not found: ${ui_sql_path}" >&2
         fi
         ${python} "$($cygpathw "${openscript}")" "${output_file}" "${ui_sql_path}" 2>/dev/null && did_open=true
       fi
@@ -1123,12 +1205,15 @@ sql_output=""
 run_sql_on () {
   local the_sql="$1"
   local title="$2"
+  local skip_print="$3"
   if [[ -f "${the_sql}" ]]; then
     if [[ -z "${title}" ]]; then
       title="${the_sql}"
     fi
-    notquiet ""
-    notquiet "Processing ${title}..."
+    if [[ "${skip_print}" != "true" ]]; then
+      notquiet ""
+      notquiet "Processing ${title}..."
+    fi
 
     local temp_sql_path="/tmp/perfetto-query-${RANDOM}.sql"
     cp "${the_sql}" "${temp_sql_path}"
@@ -1159,12 +1244,10 @@ run_sql_on () {
       sql_print="${sql_output}"
     fi
 
-    local first_line=$(head -n 1 <<< "${sql_print}")
-    local dash_line=""
-    printf -v dash_line '%*s' "${#first_line}" ''
-    dash_line=${dash_line// /-}
-    notquiet "${dash_line}"
-    echo "${sql_print}"
+    if [[ "${skip_print}" != "true" ]]; then
+      dashed_header_line "${sql_print}"
+      echo "${sql_print}"
+    fi
   else
     echo "error: sql query file not found: ${the_sql}"
   fi
@@ -1176,7 +1259,7 @@ run_surface_sql() {
   if [[ -n "${surface_stats_output}" ]]; then
     return
   fi
-  run_sql_on "${xtrace_dir}/queries/surface_stats.sql" "--surface-stats"
+  run_sql_on "${xtrace_dir}/queries/surface_stats.sql" "--surface-stats" "${suppress_surface_stats}"
   surface_stats_output="${sql_output}"
 }
 
@@ -1187,7 +1270,7 @@ run_counters_sql () {
 
   if [[  -z "${gpu_counter_stats_filter}" ]]; then
     run_surface_sql
-    read top_proc top_index <<< $(echo "${surface_stats_output}" | awk -F, '
+    read top_proc top_index <<< $(echo "${surface_stats_output}" | sed 's/\"//g' | awk -F, '
       NR==1 {
         for(i=1;i<=NF;i++) {
           if($i=="ProcessName") proc_idx=i;
@@ -1199,11 +1282,16 @@ run_counters_sql () {
       }
     ')
 
-
     if [[ -n "${top_proc}" ]]; then
       gpu_counter_stats_filter="${top_proc},${top_index}"
       if (( $(echo "${surface_stats_output}" | wc -l) > 2 )); then
         counter_stats_title="--counter-stats=${gpu_counter_stats_filter}"
+        if [[ "${suppress_surface_stats}" == true ]]; then
+          echo "  Auto-selected: ${counter_stats_title}" >&2
+          echo "  Is that the right one? Confirm with --surface-stats." >&2
+          echo "  To be explicit with --compare on traces with multiple surfaces," >&2
+          echo "  add a --counter-stats=... to the command line for each -f arg" >&2
+        fi
       fi
     else
       echo "Warning: No GPU Surface events found."
@@ -1280,7 +1368,7 @@ run_sql () {
 
 if [[ "${from_file}" == true ]]; then
   if [[ ! -f "${output_file}" ]]; then
-    echo "error: file not found: ${output_file}"
+    echo "error: file not found: ${output_file}" >&2
     exit 1
   fi
 
