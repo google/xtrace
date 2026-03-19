@@ -352,6 +352,7 @@ for (( i = 0; i < num_args; i++ )); do
   elif [[ "${args[${i}]}" = "-q" ]]; then
     i=$((i+1))
     sql_path="${args[${i}]}"
+    print_frame_stats=false
   elif [[ "${args[${i}]}" = "--ui-query" ]]; then
     i=$((i+1))
     ui_sql_path="$($cygpathw "${args[${i}]}")"
