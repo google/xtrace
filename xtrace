@@ -247,6 +247,7 @@ print_frame_stats=true
 print_surface_stats=false
 suppress_surface_stats=false
 print_gpu_counter_stats=false
+suppress_gpu_counter_stats=false
 print_cpu_top=false
 gpu_starting_freq_khz=0
 is_filtered_query_output=true
@@ -374,6 +375,8 @@ for (( i = 0; i < num_args; i++ )); do
     if [[ "${args[${i}]}" == *=* ]]; then
       gpu_counter_stats_filter="${args[${i}]#*=}"
     fi
+  elif [[ "${args[${i}]}" == "--no-counter-stats" ]]; then
+    suppress_gpu_counter_stats=true
   elif [[ "${args[${i}]}" = "--avg" ]]; then
     i=$((i+1))
     custom_stats+=("${args[${i}]}")
@@ -501,7 +504,7 @@ if [[ "${include_counters}" == true ]]; then
   else
     echo "Note: Use --gpu2 with --counters to align counter data with GPU workloads."
   fi
-  if [[ "${include_gpu2}" == true ]]; then
+  if [[ "${include_gpu2}" == true ]] && [[ "${suppress_gpu_counter_stats}" == false ]]; then
     # Enable counter stats by default with --gpu2 --counters.
     print_gpu_counter_stats=true
   fi
