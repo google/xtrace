@@ -336,14 +336,14 @@ global_gpu_stats AS (
         SUM(gpu_frequency_dur.dur) / 1e9 AS total_dur
     FROM gpu_frequency_dur
 ),
-app_frames AS (
+xr_frames AS (
     SELECT
         EXTRACT_ARG(arg_set_id, 'debug.sourcePid') AS pid,
         ts
     FROM slice
     WHERE (name = 'GPU' AND category = 'cpm' AND pid IS NOT NULL)
 ),
-app_frames2 AS (
+xr_frames2 AS (
     SELECT
         EXTRACT_ARG(arg_set_id, 'debug.sourcePid') AS pid,
         ts
@@ -408,7 +408,7 @@ cpu_frames_pre1 AS (
     UNION ALL
     /* XR app frames */
     SELECT upid, ts
-    FROM app_frames2
+    FROM xr_frames2
     JOIN process USING (pid)
 ),
 cpu_frames_pre2 AS (
@@ -416,8 +416,8 @@ cpu_frames_pre2 AS (
     FROM cpu_frames_pre1
     UNION ALL
     /* Backwards compat XR app frames */
-    SELECT process.upid, app_frames.ts
-    FROM app_frames
+    SELECT process.upid, xr_frames.ts
+    FROM xr_frames
     JOIN process USING (pid)
     LEFT JOIN cpu_frames_pre1 existing_frames ON process.upid = existing_frames.upid
     WHERE existing_frames.upid IS NULL
@@ -426,28 +426,52 @@ cpu_frames_pre3 AS (
     SELECT upid, ts
     FROM cpu_frames_pre2
     UNION ALL
-    /* 2D app frames */
+    /* Backup xr app frame events if CPM is missing them (requires atrace gfx). */
     SELECT thread_slice.upid, thread_slice.ts
     FROM thread_slice
     LEFT JOIN cpu_frames_pre2 existing_frames ON thread_slice.upid = existing_frames.upid
     WHERE
         existing_frames.upid IS NULL
+        AND thread_slice.name = 'oxr_xrEndFrame'
+),
+cpu_frames_pre4 AS (
+    SELECT upid, ts
+    FROM cpu_frames_pre3
+    UNION ALL
+    /* 2D app frames */
+    SELECT thread_slice.upid, thread_slice.ts
+    FROM thread_slice
+    LEFT JOIN cpu_frames_pre3 existing_frames ON thread_slice.upid = existing_frames.upid
+    WHERE
+        existing_frames.upid IS NULL
+        /* GLES/Vulkan present events from atrace gfx. */
+        AND thread_slice.name IN ('eglSwapBuffers', 'QueuePresentKHR')
+),
+cpu_frames_pre5 AS (
+    SELECT upid, ts
+    FROM cpu_frames_pre4
+    UNION ALL
+    /* 2D app frames */
+    SELECT thread_slice.upid, thread_slice.ts
+    FROM thread_slice
+    LEFT JOIN cpu_frames_pre4 existing_frames ON thread_slice.upid = existing_frames.upid
+    WHERE
+        existing_frames.upid IS NULL
         /* Alternate app frame events.
            This only works if a single process uses only one of these. */
         AND thread_slice.name IN (
-            'oxr_xrEndFrame', /* OpenXR event from ATRACE gfx category */
             'SkiaRenderer::SwapBuffers', /* Chrome compositor frame */
             'Choreographer#scheduleVsyncLocked') /* Android app frame */
 ),
 cpu_frames AS (
     SELECT upid, ts
-    FROM cpu_frames_pre3
+    FROM cpu_frames_pre5
     UNION ALL
     /* Any other GPU usage by a process that does not have a known CPU frame
        gets 1 CPU frame per GPU slice. */
     SELECT ge.upid, ge.ts
     FROM gpu_events ge
-    LEFT JOIN cpu_frames_pre3 existing_frames ON ge.upid = existing_frames.upid
+    LEFT JOIN cpu_frames_pre5 existing_frames ON ge.upid = existing_frames.upid
     WHERE existing_frames.upid IS NULL
 ),
 combined_extents AS (
