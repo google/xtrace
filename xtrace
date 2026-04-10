@@ -161,7 +161,7 @@ show_help_and_exit() {
   echo ""
   echo "--frame-stats output:"
   echo "  Note: CPU and GPU usage is based on runtime durations, ignoring frequency."
-  echo "  W H: Width, height of framebuffer (when available)"
+  echo "  W H: Width, height of framebuffer (when available)."
   echo "  GpuMSPF: GPU usage in ms per frame."
   echo "  FPS: Frames per second."
   echo "  Frames: Total submitted frame count."
@@ -173,6 +173,28 @@ show_help_and_exit() {
   echo "  Dur: Duration in seconds that the process executed frames."
   echo "  GpuFreq: Average GPU frequency during the trace (not per process)."
   echo "  Watts: Average power usage in watts of the whole system (not per process)."
+  echo ""
+  echo '--surface-stats output:'
+  echo '  These are the different GPU Surface events found in the --gpu1 or --gpu2 trace.'
+  echo '  Note: If there are multiple Surface events in a single process, such as multiple render passes,'
+  echo '        they should be in a fixed number per frame for accurate differentiation in these stats.'
+  echo '  W H: Width, height of surface.'
+  echo '  MSAA: MSAA sample count.'
+  echo '  RTs: Number of render targets.'
+  echo '  RTBPP: Total bits per pixel for all render targets.'
+  echo '  GpuMSPF: GPU times for this surface in ms per frame.'
+  echo '  BinMSPF: Time spent binning in ms per frame.'
+  echo '  RenderMSPF: Time spent rendering in ms per frame.'
+  echo '  Frames: Number of surface frames.'
+  echo '  Bins: Number of bins (tiles).'
+  echo '  BinW, BinH: Individual tile resolution.'
+  echo ""
+  echo '--counter-stats output:'
+  echo '  Counter stats data is output for a specific surface* and separated by render stages.'
+  echo '  *Dispatch is for compute shader passes (if any), and is not associated with a specific surface.'
+  echo '  - $$$ counters at the top are synthesized from other counter data.'
+  echo '  - Percent or averaged counters are summed and weighted-averaged for each stage.'
+  echo '  - The other counters are converted to per frame averages.'
   echo ""
   echo "--top output:"
   echo "  Note: CPU usage is based on durations, ignoring CPU frequency."
@@ -591,7 +613,8 @@ if [[ "${is_local}" == false ]] && [[ "${from_file}" == false ]]; then
     echo ""
     echo " --> Now restart the target app(s) and trace with --gpu1 or --gpu2 and/or --counters."
     echo ""
-    echo "NOTE: CPU usage is slightly higher while GPU tracing is enabled, even while not tracing."
+    echo "NOTE: Target APK must be debuggable for these events to work."
+    echo "NOTE: CPU usage is higher while GPU tracing is enabled, even while not tracing."
   fi
 
   if [[ "${disable_gpu}" == true ]]; then
