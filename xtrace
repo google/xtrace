@@ -562,7 +562,7 @@ chrome_disabled_categories="${chrome_disabled_categories%","}"
 
 if [[ "${is_compare}" == true ]]; then
   if [[ "${#trace_input_files[@]}" -lt 2 ]]; then
-    echo "error: --compare requires at least two -f traces."
+    echo "error: --compare requires at least two -f traces." >&2
     exit 1
   fi
 
@@ -737,7 +737,7 @@ if [[ "${is_local}" == false ]] && [[ "${from_file}" == false ]]; then
   if [[ "${from_file}" == false ]]; then
     target_name=$(adb shell getprop ro.product.model)
     [[ -z "${target_name}" ]] &&
-      echo "error: no adb device" && exit 1
+      echo "error: no adb device" >&2 && exit 1
     is_android=true
   fi
 
@@ -753,7 +753,7 @@ if [[ "${is_local}" == false ]] && [[ "${from_file}" == false ]]; then
     if [[ "${target_name}" = *SM* ]]; then
       gpu_perfetto_enabled=$(adb shell getprop debug.graphics.gpu.profiler.perfetto | tr -d '\r')
       [[ ! "${gpu_perfetto_enabled}" == 1 ]] &&
-        echo "error: GPU tracing is not enabled." &&
+        echo "error: GPU tracing is not enabled." >&2 &&
         echo "" &&
         echo " --> Run xtrace --enable-gpu and then restart the target app" &&
         exit 1
@@ -763,7 +763,7 @@ if [[ "${is_local}" == false ]] && [[ "${from_file}" == false ]]; then
   if [[ "${include_counters}" == true ]]; then
     perfcounter=$(adb shell cat ${adreno_perfcounter_file} | tr -d '\r')
     [[ ! "${perfcounter}" == 1 ]] &&
-      echo "error: GPU counters are not enabled" &&
+      echo "error: GPU counters are not enabled" >&2 &&
       echo "" &&
       echo " --> Run xtrace --enable-gpu and then restart the target app" &&
       exit 1
@@ -1346,7 +1346,7 @@ run_sql_on () {
       echo "${sql_print}"
     fi
   else
-    echo "error: sql query file not found: ${the_sql}"
+    echo "error: sql query file not found: ${the_sql}" >&2
   fi
 }
 
@@ -1505,7 +1505,7 @@ set_title() {
   if touch "${output_file}"; then
     rm "${output_file}"
   else
-    echo "error: output file is not writable: ${output_file}"
+    echo "error: output file is not writable: ${output_file}" >&2
     exit 1
   fi
 }
@@ -1679,7 +1679,7 @@ if ! adb pull ${android_trace} ${output_file} > /dev/null 2>&1; then
     sleep 1
     adb wait-for-device
     adb pull ${android_trace} ${output_file} \
-        || { echo "error: failed to adb pull ${android_trace} ${output_file}" ; exit 1; }
+        || { echo "error: failed to adb pull ${android_trace} ${output_file}" >&2 ; exit 1; }
   fi
 fi
 du -hs "${output_file}"
