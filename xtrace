@@ -85,7 +85,18 @@ show_help_and_exit() {
   ecRT "  [--unlock-head]          [XR] Unlock the head pose"
   echo "  [--screen-timeout <ms>]  Set screen timeout and wake up the device. <ms> can be"
   echo "                           an integer ms or a duration string like 1h20m."
-  ecNR "                           Note: proximity sensor must be touched to wake device."
+  echo "                           Note: proximity sensor must be touched to wake device."
+  echo "  [--wake <seconds>]       Similar to --screen-timeout, but for cases where manually"
+  echo "                           touching the proximity sensor is not feasible, such as automated"
+  echo "                           testing, remote devices, and AI agents. To use --wake, the proximity"
+  echo "                           sensor can be covered while still ensuring the display will sleep to"
+  echo "                           prevent burn-in. Example usage:"
+  echo "                             - Cover the proximity sensor (ie: with paper)"
+  echo "                             - Test loop:"
+  echo "                               - Run 'xtrace --wake 30m'"
+  echo "                               - Run test on device, capture trace, etc."
+  echo "                             - Run 'xtrace --kill-sleeper' and uncover the sensor."
+  echo "  [--kill-sleeper]         Kill the sleeper daemon that was started by --wake."
   echo ""
   echo "Processing options:"
   echo "  [-f /path/to/trace]      Load existing trace file instead of recording a trace"
@@ -305,6 +316,8 @@ fill_policy=RING_BUFFER
 verbose_logs=false
 verbose_err="/dev/null"
 is_quiet=false
+kill_sleeper=false
+wake_seconds=''
 
 # See /vendor/bin/gpu_counter_producer or /system/bin/gpu_counter_producer on supported devices.
 gpu_counter_producer="gpu_counter_producer"
@@ -317,6 +330,10 @@ duration_to_ms() {
   local duration="$1"
   local ms=$(($(echo "${duration}" | sed 's/h/*3600000+/g; s/m/*60000+/g; s/s/*1000+/g' | sed 's/+$/ /g')))
   echo "${ms}"
+}
+
+duration_to_s() {
+  echo $(($(echo "$1" | sed 's/h/*3600+/g; s/m/*60+/g; s/s/*1+/g' | sed 's/+$/ /g')))
 }
 
 verbose() {
@@ -448,6 +465,13 @@ for (( i = 0; i < num_args; i++ )); do
   elif [[ "${args[${i}]}" = "--screen-timeout" ]]; then
     i=$((i+1))
     screen_timeout_ms=$(duration_to_ms "${args[${i}]}")
+    skip_tracing=true
+  elif [[ "${args[${i}]}" = "--wake" ]]; then
+    i=$((i+1))
+    wake_seconds=$(duration_to_s "${args[${i}]}")
+    skip_tracing=true
+  elif [[ "${args[${i}]}" = "--kill-sleeper" ]]; then
+    kill_sleeper=true
     skip_tracing=true
   elif [[ "${args[${i}]}" = "--screenshot" ]]; then
     screenshot=true
@@ -595,6 +619,22 @@ fi
 
 
 adreno_perfcounter_file="/sys/class/kgsl/kgsl-3d0/perfcounter"
+sleeper_pid_file="/data/local/tmp/xtrace_sleeper.pid"
+
+kill_sleeper_daemon() {
+  adb wait-for-device shell "
+    if [ -f $sleeper_pid_file ]; then
+      OLD_PID=\$(cat $sleeper_pid_file)
+      if kill -0 \$OLD_PID 2>/dev/null; then
+        kill -9 \$OLD_PID 2>/dev/null
+      fi
+      rm -f $sleeper_pid_file
+      echo '1'
+    else
+      echo '0'
+    fi
+  "
+}
 
 target_name="local"
 if [[ "${is_local}" == false ]] && [[ "${from_file}" == false ]]; then
@@ -646,6 +686,35 @@ if [[ "${is_local}" == false ]] && [[ "${from_file}" == false ]]; then
     echo "Set doff screen timeout to ${screen_timeout_ms} ms."
     adb shell settings put system doff_screen_timeout_ms "${screen_timeout_ms}"
     adb shell input keyevent KEYCODE_WAKEUP
+  fi
+
+  if [[ "${kill_sleeper}" == true ]]; then
+    kill_result=$(kill_sleeper_daemon)
+    if [[ "${kill_result}" == "1" ]]; then
+      echo 'Terminated the sleeper daemon. Remember to uncover the proximity sensor.'
+    elif [[ "${kill_result}" == "0" ]]; then
+      echo 'No sleeper daemon found.'
+    else
+      echo 'error: adb failed' >&2 && exit 1
+    fi
+  fi
+
+  if [[ -n "${wake_seconds}" ]]; then
+    [[ -z $(kill_sleeper_daemon) ]] && [[ -z $(kill_sleeper_daemon) ]] &&
+      echo 'error: adb failed' >&2 && exit 1
+
+    echo "The device will sleep in ${wake_seconds} seconds (see --help for details)."
+    echo "To reset, run 'adb reboot' or 'xtrace --kill-sleeper'."
+
+    # Wake the device and spawn a new sleeper daemon.
+    adb wait-for-device \
+        shell "nohup sh -c 'echo \$\$ > $sleeper_pid_file; \
+                            input keyevent KEYCODE_WAKEUP; \
+                            sleep $wake_seconds; \
+                            while true; do \
+                              input keyevent KEYCODE_SLEEP; \
+                              sleep 5; \
+                            done' >/dev/null 2>&1 &"
   fi
 
   if [[ ! -z "${lock_head}" ]]; then
