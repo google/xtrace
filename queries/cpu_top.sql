@@ -163,20 +163,39 @@ trace_extents AS (
     SELECT
         (MAX(ts) - MIN(ts)) / 1000000 AS trace_ms
     FROM ftrace_event
+),
+final_results AS (
+    SELECT
+        ROW_NUMBER() OVER (ORDER BY all_cpu_dur_ms DESC) AS Rank,
+        CASE
+            WHEN (LENGTH(name) > 60) THEN SUBSTR(name, 0, 60) || '+'
+            ELSE name
+            END AS ProcessName,
+        printf('%g', ROUND(100.0 * gpu_dur.gpu_dur_ms / trace_ms, 3)) AS GpuPct,
+        printf('%g', ROUND(100.0 * all_cpu_dur_ms / trace_ms, 3)) AS CpuPct,
+        top_thread1 AS TopThread1,
+        printf('%g', ROUND(100.0 * thread1_cpu_dur_ms / trace_ms, 3)) AS CpuPct1,
+        top_thread2 AS TopThread2,
+        printf('%g', ROUND(100.0 * thread2_cpu_dur_ms / trace_ms, 3)) AS CpuPct2
+    FROM top_cpu_users
+    LEFT JOIN gpu_dur USING (upid)
+    CROSS JOIN trace_extents
+    LIMIT 20
 )
-SELECT
-    ROW_NUMBER() OVER (ORDER BY all_cpu_dur_ms DESC) AS Rank,
-    CASE
-        WHEN (LENGTH(name) > 60) THEN SUBSTR(name, 0, 60) || '+'
-        ELSE name
-        END AS ProcessName,
-    printf('%g', ROUND(100.0 * gpu_dur.gpu_dur_ms / trace_ms, 3)) AS GpuPct,
-    printf('%g', ROUND(100.0 * all_cpu_dur_ms / trace_ms, 3)) AS CpuPct,
-    top_thread1 AS TopThread1,
-    printf('%g', ROUND(100.0 * thread1_cpu_dur_ms / trace_ms, 3)) AS CpuPct1,
-    top_thread2 AS TopThread2,
-    printf('%g', ROUND(100.0 * thread2_cpu_dur_ms / trace_ms, 3)) AS CpuPct2
-FROM top_cpu_users
-LEFT JOIN gpu_dur USING (upid)
-CROSS JOIN trace_extents
-LIMIT 20
+SELECT Rank, ProcessName, GpuPct, CpuPct, TopThread1, CpuPct1, TopThread2, CpuPct2
+FROM (
+    SELECT 1 AS sort_key, Rank, ProcessName, GpuPct, CpuPct, TopThread1, CpuPct1, TopThread2, CpuPct2 FROM final_results
+    UNION ALL
+    SELECT
+        2 AS sort_key,
+        NULL AS Rank,
+        '-- non-idle totals --' AS ProcessName,
+        printf('%g', ROUND(100.0 * COALESCE((SELECT SUM(active_dur) / 1e6 FROM kgsl_gpu), 0) / MAX(1, trace_ms), 3)) AS GpuPct,
+        printf('%g', ROUND(100.0 * COALESCE((SELECT SUM(dur) / 1e6 FROM sched LEFT JOIN thread t USING (utid) LEFT JOIN process p USING (upid) WHERE (p.name IS NOT NULL OR t.name != 'swapper')), 0) / MAX(1, trace_ms), 3)) AS CpuPct,
+        NULL AS TopThread1,
+        NULL AS CpuPct1,
+        NULL AS TopThread2,
+        NULL AS CpuPct2
+    FROM trace_extents
+)
+ORDER BY sort_key, Rank;
