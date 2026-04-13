@@ -186,7 +186,8 @@ filtered_stages AS (
       g.surface_ts,
       SUM(CASE WHEN o.stage_type = 'Binning' THEN o.dur ELSE 0 END) as bin_dur,
       SUM(CASE WHEN o.stage_type = 'Render' THEN o.dur ELSE 0 END) as render_dur,
-      SUM(CASE WHEN o.stage_type = 'Preempt' THEN o.dur ELSE 0 END) as preempt_dur
+      SUM(CASE WHEN o.stage_type = 'Preempt' THEN o.dur ELSE 0 END) as preempt_dur,
+      MAX(CASE WHEN o.stage_type = 'Render' THEN o.dur ELSE NULL END) as max_render_dur
     FROM ordered_events o
     JOIN group_selection g ON o.surface_group_id = g.surface_group_id AND o.upid = g.upid
     WHERE o.type = 'stage' AND g.surface_group_id > 0
@@ -203,6 +204,7 @@ SELECT
     printf('%.3f', (SUM(surface_slices.dur) - COALESCE(SUM(filtered_stages.preempt_dur), 0)) / 1000000.0 / MAX(1, COUNT(*))) AS GpuMSPF,
     printf('%.3f', COALESCE(SUM(filtered_stages.bin_dur), 0) / 1000000.0 / MAX(1, COUNT(*))) AS BinMSPF,
     printf('%.3f', COALESCE(SUM(filtered_stages.render_dur), 0) / 1000000.0 / MAX(1, COUNT(*))) AS RenderMSPF,
+    printf('%.3f', COALESCE(MAX(filtered_stages.max_render_dur), 0) / 1000000.0) AS RenderMaxMS,
     COUNT(*) AS Frames,
     CAST(AVG(surface_slices.numBins) AS INT) AS Bins,
     CAST(AVG(surface_slices.binWidth) AS INT) AS BinW,
