@@ -123,6 +123,9 @@ show_help_and_exit() {
   echo "                           Note: Duration is wall-clock-based, not thread run/sleep based."
   echo ""
   echo "Trace recording options:"
+  echo "  [--perf-dump]            Trace the device and report comprehensive performance stats along with"
+  echo "                           instructions for interpreting them. This output can be piped to an AI chat"
+  echo "                           bot to help pinpoint performance problems."
   echo "  [--local]                Trace local OS instead of adb device (requires perfetto instrumentation)."
   echo "  [-t <duration_ms>]       Duration to trace (default is until Ctrl-C). Also supports h/m/s suffix:"
   echo "                           Examples: \"1m5s\" (1 minute + 5 seconds) or \"300\" (300 ms)"
@@ -158,6 +161,7 @@ show_help_and_exit() {
   echo "  [<ftrace category>] ...  Enabled ftrace categories, must contain / character (ie: kmem/rss_stat)"
   echo ""
   echo "Examples:"
+  echo "  xtrace --perf-dump               Capture comprehensive AI-friendly performance report"
   echo "  xtrace                           Trace adb device until Ctrl-C"
   echo "  xtrace -t 1s                     Trace for 1 second"
   echo "  xtrace --gpu2 --counters         Trace detailed GPU events and counters"
@@ -232,7 +236,8 @@ os=$(uname -o)
 python=python
 python3 -c quit > /dev/null 2>&1 && python=python3
 
-xtrace_dir=$(dirname "$0")
+xtrace_dir="$(cd -P "$(dirname "$0")" && pwd -P)"
+xtrace_exec="${xtrace_dir}/${0##*/}"
 
 bg_bash="bash -mc"
 if [[ "${os}" = "Msys" ]]; then
@@ -247,6 +252,7 @@ else
 fi
 
 data_dir="${xtrace_dir}/data/adreno"
+perf_dump_prologue="${xtrace_dir}/docs/prompts/perf_dump_prologue.md"
 
 if [[ "${os}" = "Msys" ]]; then
   cygpathw='cygpath -w'
@@ -283,7 +289,7 @@ print_gpu_counter_stats=false
 suppress_gpu_counter_stats=false
 print_cpu_top=false
 gpu_starting_freq_khz=0
-is_filtered_query_output=true
+query_output_format=text
 verbose_sql_logs=false
 is_local=false
 is_android=true
@@ -318,6 +324,7 @@ verbose_err="/dev/null"
 is_quiet=false
 kill_sleeper=false
 wake_seconds=''
+perf_dump=false
 
 # See /vendor/bin/gpu_counter_producer or /system/bin/gpu_counter_producer on supported devices.
 gpu_counter_producer="gpu_counter_producer"
@@ -398,7 +405,10 @@ for (( i = 0; i < num_args; i++ )); do
     i=$((i+1))
     ui_sql_path="$($cygpathw "${args[${i}]}")"
   elif [[ "${args[${i}]}" = "--csv-output" ]]; then
-    is_filtered_query_output=false
+    query_output_format=csv
+  elif [[ "${args[${i}]}" = "--md-output" ]]; then
+    query_output_format=md
+    subtitle_prefix="### "
   elif [[ "${args[${i}]}" = "--verbose-sql-logs" ]]; then
     verbose_sql_logs=true
   elif [[ "${args[${i}]}" = "--frame-stats" ]]; then
@@ -528,6 +538,9 @@ for (( i = 0; i < num_args; i++ )); do
     title_args+=("no-perfetto")
   elif [[ "${args[${i}]}" = "--symbolize-ksyms" ]]; then
     symbolize_ksyms=true
+  elif [[ "${args[${i}]}" = "--perf-dump" ]]; then
+    perf_dump=true
+    include_gpu2=true
   elif [[ "${args[${i}]}" = -* ]]; then
     echo "warning: ignoring unknown option ${args[${i}]}"
   else
@@ -593,7 +606,7 @@ if [[ "${is_compare}" == true ]]; then
     csv_files+=($($cygpathw "${csv_file}"))
 
     notquiet "Processing $((idx+1)): ${file}..."
-    "${0}" "${compare_args[@]}" "${c_stat}" -f "${file}" > "${csv_file}" 2> "${csv_file}.err" &
+    "${xtrace_exec}" "${compare_args[@]}" "${c_stat}" -f "${file}" > "${csv_file}" 2> "${csv_file}.err" &
   done
 
   wait
@@ -739,6 +752,11 @@ if [[ "${is_local}" == false ]] && [[ "${from_file}" == false ]]; then
     [[ -z "${target_name}" ]] &&
       echo "error: no adb device" >&2 && exit 1
     is_android=true
+    if adb shell "[ -d /sys/class/kgsl ]" ; then
+      is_kgsl=true
+    else
+      is_kgsl=false
+    fi
   fi
 
   if [[ "${target_name}" = *SM* ]]; then
@@ -750,7 +768,7 @@ if [[ "${is_local}" == false ]] && [[ "${from_file}" == false ]]; then
     # up using the RING_BUFFER policy. So we force the DISCARD policy here.
     fill_policy=DISCARD
 
-    if [[ "${target_name}" = *SM* ]]; then
+    if [[ "${is_kgsl}" == true ]]; then
       gpu_perfetto_enabled=$(adb shell getprop debug.graphics.gpu.profiler.perfetto | tr -d '\r')
       [[ ! "${gpu_perfetto_enabled}" == 1 ]] &&
         echo "error: GPU tracing is not enabled." >&2 &&
@@ -771,6 +789,26 @@ if [[ "${is_local}" == false ]] && [[ "${from_file}" == false ]]; then
   fi
 else
   is_android=false
+fi
+
+if [[ "${perf_dump}" == true ]]; then
+  echo "Reproduce the performance problem consistently for the next 10 seconds..."
+  sleep 1
+  echo ""
+  cat "${perf_dump_prologue}"
+  echo ""
+  echo "## Device and GPU info"
+  echo ""
+  "${xtrace_exec}" --info
+  echo ""
+  echo "## Trace #1: Accurate GPU Frame Timing Stats"
+  echo ""
+  "${xtrace_exec}" --no-open --md-output -t 5s --gpu1 --frame-stats --surface-stats --top
+  echo ""
+  echo "## Trace #2: Detailed GPU Counters, Tiling and Binning Info"
+  echo ""
+  "${xtrace_exec}" --no-open --md-output -t 5s --gpu2 --counters --no-frame-stats --surface-stats --counter-stats
+  exit 0
 fi
 
 title_args+=("${target_name// /_}")
@@ -1299,6 +1337,22 @@ run_trace_processor() {
 
 sql_output=""
 
+csv2md() {
+  # Use the first argument as the file, or fallback to stdin if no argument is passed
+  local input="${1:-/dev/stdin}"
+
+  cat "$input" | ${python} -c '
+from __future__ import print_function
+import csv, sys
+reader = list(csv.reader(sys.stdin))
+if not reader: sys.exit(0)
+print("| " + " | ".join(reader[0]) + " |")
+print("|" + "|".join(["---"] * len(reader[0])) + "|")
+for row in reader[1:]:
+    print("| " + " | ".join(row) + " |")
+'
+}
+
 run_sql_on () {
   local the_sql="$1"
   local title="$2"
@@ -1309,7 +1363,7 @@ run_sql_on () {
     fi
     if [[ "${skip_print}" != "true" ]]; then
       notquiet ""
-      notquiet "Processing ${title}..."
+      notquiet "${subtitle_prefix}Processing ${title}..."
     fi
 
     local temp_sql_path="/tmp/perfetto-query-${RANDOM}.sql"
@@ -1333,7 +1387,10 @@ run_sql_on () {
       sed -i -e "s@${search_string}@${replace_string}@g" "${temp_sql_path}"
     done
 
-    if [[ "${is_filtered_query_output}" == true ]]; then
+    if [[ "${query_output_format}" == md ]]; then
+      sql_output=$(run_trace_processor "${temp_sql_path}" | sed 's/\"//g' | sed 's/\[NULL\]/-/g' | sed '/^$/d')
+      sql_print=$(echo "${sql_output}" | csv2md)
+    elif [[ "${query_output_format}" == text ]]; then
       sql_output=$(run_trace_processor "${temp_sql_path}" | sed 's/\"//g' | sed 's/\[NULL\]/-/g' | sed '/^$/d')
       sql_print=$(echo "${sql_output}" | column -s, -t)
     else
@@ -1451,7 +1508,7 @@ run_sql () {
   fi
 
   if [[ "${print_cpu_top}" == true ]]; then
-    run_sql_on "${xtrace_dir}/queries/cpu_top.sql" "--cpu-top"
+    run_sql_on "${xtrace_dir}/queries/cpu_top.sql" "--top"
   fi
 
   if [[ "${print_surface_stats}" == true ]]; then
@@ -1603,8 +1660,8 @@ fi
 
 if [[ "${use_binary_config}" == true ]]; then
   "protoc" --encode=perfetto.protos.TraceConfig \
-          "--proto_path=$($cygpathw $(dirname $0))" \
-          "$($cygpathw $(dirname $0)/third_party/perfetto/perfetto_config.proto)" \
+          "--proto_path=$($cygpathw "${xtrace_dir}")" \
+          "$($cygpathw "${xtrace_dir}/third_party/perfetto/perfetto_config.proto")" \
           < "${config_filepath}" \
           > "${config_filepath}.bin" \
       || exit 1
