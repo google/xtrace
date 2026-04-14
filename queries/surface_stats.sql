@@ -139,6 +139,7 @@ surface_slices AS (
         EXTRACT_ARG(arg_set_id, 'binHeight') AS binHeight,
         EXTRACT_ARG(arg_set_id, 'MSAA') AS msaa,
         EXTRACT_ARG(arg_set_id, 'numRenderTargets') AS render_targets,
+        EXTRACT_ARG(arg_set_id, 'renderMode') AS renderMode,
         (
             SELECT SUM(CAST(COALESCE(int_value, string_value) AS INT))
             FROM args
@@ -208,7 +209,8 @@ SELECT
     COUNT(*) AS Frames,
     CAST(AVG(surface_slices.numBins) AS INT) AS Bins,
     CAST(AVG(surface_slices.binWidth) AS INT) AS BinW,
-    CAST(AVG(surface_slices.binHeight) AS INT) AS BinH
+    CAST(AVG(surface_slices.binHeight) AS INT) AS BinH,
+    MAX(surface_slices.renderMode) AS RenderMode
 FROM surface_slices
 LEFT JOIN filtered_stages ON surface_slices.upid = filtered_stages.upid AND surface_slices.ts = filtered_stages.surface_ts
 JOIN process ON process.upid = surface_slices.upid
