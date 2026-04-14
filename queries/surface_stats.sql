@@ -203,6 +203,7 @@ SELECT
     CAST(AVG(surface_slices.render_targets) AS INT) AS RTs,
     CAST(AVG(surface_slices.render_target_bpp) AS INT) AS RTBPP,
     printf('%.3f', (SUM(surface_slices.dur) - COALESCE(SUM(filtered_stages.preempt_dur), 0)) / 1000000.0 / MAX(1, COUNT(*))) AS GpuMSPF,
+    printf('%.3f', MAX(surface_slices.dur - COALESCE(filtered_stages.preempt_dur, 0)) / 1000000.0) AS GpuMaxMS,
     printf('%.3f', COALESCE(SUM(filtered_stages.bin_dur), 0) / 1000000.0 / MAX(1, COUNT(*))) AS BinMSPF,
     printf('%.3f', COALESCE(SUM(filtered_stages.render_dur), 0) / 1000000.0 / MAX(1, COUNT(*))) AS RenderMSPF,
     printf('%.3f', COALESCE(MAX(filtered_stages.max_render_dur), 0) / 1000000.0) AS RenderMaxMS,

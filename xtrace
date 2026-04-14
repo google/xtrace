@@ -109,6 +109,7 @@ show_help_and_exit() {
   echo "  [--no-frame-stats]       Do not print frame stats"
   echo "  [--surface-stats]        Print GPU surface stats"
   echo "  [--no-surface-stats]     Do not print GPU surface stats"
+  echo "  [--drop-stats]           Print frame drop statistics"
   echo "  [--counter-stats]        Print detailed GPU counter stats for a target process and surface."
   echo "                           This requires a trace with --gpu2 --counters."
   echo "                           Usage: --counter-stats[=<app_name>,<surface_index>/<total_surfaces>]"
@@ -289,6 +290,7 @@ suppress_surface_stats=false
 print_gpu_counter_stats=false
 suppress_gpu_counter_stats=false
 print_cpu_top=false
+print_drop_stats=false
 gpu_starting_freq_khz=0
 query_output_format=text
 verbose_sql_logs=false
@@ -432,6 +434,8 @@ for (( i = 0; i < num_args; i++ )); do
     fi
   elif [[ "${args[${i}]}" == "--no-counter-stats" ]]; then
     suppress_gpu_counter_stats=true
+  elif [[ "${args[${i}]}" == "--drop-stats" ]]; then
+    print_drop_stats=true
   elif [[ "${args[${i}]}" = "--avg" ]]; then
     i=$((i+1))
     custom_stats+=("${args[${i}]}")
@@ -811,7 +815,7 @@ if [[ "${perf_dump}" == true ]]; then
   echo ""
   echo "## Trace #1: Accurate GPU Frame Timing Stats"
   echo ""
-  "${xtrace_exec}" --no-open --md-output -t 5s --gpu1 --frame-stats --surface-stats --top
+  "${xtrace_exec}" --no-open --md-output -t 5s --gpu1 --frame-stats --surface-stats --top --drop-stats
   echo ""
   echo "## Trace #2: Detailed GPU Counters, Tiling and Binning Info"
   echo ""
@@ -1519,6 +1523,10 @@ run_sql () {
 
   if [[ "${print_cpu_top}" == true ]]; then
     run_sql_on "${xtrace_dir}/queries/cpu_top.sql" "--top"
+  fi
+
+  if [[ "${print_drop_stats}" == true ]]; then
+    run_sql_on "${xtrace_dir}/queries/drop_stats.sql" "--drop-stats"
   fi
 
   if [[ "${print_surface_stats}" == true ]]; then
