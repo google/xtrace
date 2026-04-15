@@ -148,6 +148,7 @@ show_help_and_exit() {
   echo "  [--counters]             Include GPU counters (combine with --gpu2 for best results)"
   echo "  [--vk]                   Include Vulkan API tracing"
   echo "  [--no-ftrace]            Do not include common ftrace data"
+  ecRT "  [--no-kgsl-ftrace]       Do not include kgsl/adreno ftrace events"
   echo "  [--no-atrace]            Do not include common atrace categories"
   echo "  [--no-perfetto]          Do not include common perfetto categories"
   echo "  [--no-atrace-apps]       Do not include atrace from all apps (default)"
@@ -295,6 +296,11 @@ is_local=false
 is_android=true
 time_ms=0
 include_ftrace_defaults=true
+if is_adb_root; then
+  include_kgsl_ftrace=true
+else
+  include_kgsl_ftrace=false
+fi
 include_atrace_defaults=true
 include_perfetto_defaults=true
 symbolize_ksyms=false
@@ -530,6 +536,8 @@ for (( i = 0; i < num_args; i++ )); do
   elif [[ "${args[${i}]}" = "--no-ftrace" ]]; then
     include_ftrace_defaults=false
     title_args+=("no-ftrace")
+  elif [[ "${args[${i}]}" == "--no-kgsl-ftrace" ]]; then
+    include_kgsl_ftrace=false
   elif [[ "${args[${i}]}" = "--no-atrace" ]]; then
     include_atrace_defaults=false
     title_args+=("no-atrace")
@@ -885,11 +893,13 @@ EOL
     ftrace_events+=("gpu_mem/gpu_mem_total")
     ftrace_events+=("kmem/rss_stat")
     ftrace_events+=("thermal/*")
-    ftrace_events+=("kgsl/gpu_frequency")
-    ftrace_events+=("kgsl/adreno_cmdbatch_sync")
-    ftrace_events+=("kgsl/adreno_cmdbatch_queued")
-    ftrace_events+=("kgsl/adreno_cmdbatch_submitted")
-    ftrace_events+=("kgsl/adreno_cmdbatch_retired")
+    if [[ "${include_kgsl_ftrace}" == true ]]; then
+      ftrace_events+=("kgsl/gpu_frequency")
+      ftrace_events+=("kgsl/adreno_cmdbatch_sync")
+      ftrace_events+=("kgsl/adreno_cmdbatch_queued")
+      ftrace_events+=("kgsl/adreno_cmdbatch_submitted")
+      ftrace_events+=("kgsl/adreno_cmdbatch_retired")
+    fi
     ftrace_events+=("dcvsh/dcvsh_freq")
     if [[ "${symbolize_ksyms}" == true ]]; then
       ftrace_events+=("workqueue/*")
