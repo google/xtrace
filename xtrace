@@ -132,7 +132,7 @@ show_help_and_exit() {
   echo "                           Examples: \"1m5s\" (1 minute + 5 seconds) or \"300\" (300 ms)"
   echo "  [-o <output_file_or_dir>]  Write trace to a file or directory"
   echo "  [-b <buffer_size_kb>]    Size of trace buffer in KB (default is ${buffer_size_kb})"
-  echo "  [-p /path/to/perfetto]   Path to perfetto tool if it's not in \$PATH"
+  echo "  [-p /path/to/perfetto]   Path to perfetto tool if it is not in \$PATH"
   echo "  [-c /path/to/config]     Use existing textproto config file instead of generating it"
   echo "  [-i <period_ms>]         Incremental update period in ms"
   echo "  [--screenshot]           [XR] Capture a raw screenshot alongside the trace"
@@ -815,15 +815,68 @@ if [[ "${perf_dump}" == true ]]; then
   echo ""
   echo "## Device and GPU info"
   echo ""
-  "${xtrace_exec}" --info
+
+  trace1_args=(--no-open --md-output -t 5s --gpu1 --frame-stats --surface-stats --top --drop-stats)
+  trace2_args=(--no-open --md-output -t 5s --gpu2 --counters --no-frame-stats --surface-stats --counter-stats)
+
+  if [[ "${screenshot}" == true ]]; then
+    trace2_args+=(--screenshot)
+  fi
+
+  for (( idx = 0; idx < ${#categories[@]}; idx++ )); do
+    trace1_args+=("cat.${categories[$idx]}")
+    trace2_args+=("cat.${categories[$idx]}")
+  done
+
+  if [[ -d "${output_file}" ]]; then
+    # Output results to directory.
+    trace1_args+=("-o" "${output_file}")
+    trace2_args+=("-o" "${output_file}")
+  else
+    trace1_args+=("-o" "./trace-perf-dump-${now}-gpu1.perfetto")
+    trace2_args+=("-o" "./trace-perf-dump-${now}-gpu2.perfetto")
+  fi
+
+  if [[ "${#trace_input_files[@]}" -gt 0 ]]; then
+    if [[ "${#trace_input_files[@]}" -gt 1 ]]; then
+      trace1="${trace_input_files[0]}"
+      trace2="${trace_input_files[1]}"
+      if [[ "${trace1}" == *-gpu2* ]] && [[ "${trace2}" == *-gpu1* ]]; then
+        temp_trace1="${trace1}"
+        trace1="${trace2}"
+        trace2="${temp_trace1}"
+      fi
+    else
+      trace1="${trace_input_files[0]}"
+      trace2="${trace_input_files[0]}"
+    fi
+    trace1_args+=("-f" "${trace1}")
+    trace2_args+=("-f" "${trace2}")
+    echo "Analyzing given trace files:"
+    echo "- Trace #1: ${trace1}"
+    if [[ "${trace1}" == *-gpu2* ]]; then
+      echo "  Note: With a gpu2 trace file, the GPU frame durations are longer than usual."
+    elif [[ "${trace1}" != *-gpu1* ]]; then
+      echo "  Note: This trace file may be missing GPU stats."
+    fi
+    echo "- Trace #2: ${trace2}"
+    if [[ "${trace2}" == *-gpu1* ]]; then
+      echo "  Note: With a gpu1 trace file, the GPU renderstage and counter details are missing."
+    elif [[ "${trace2}" != *-gpu2* ]]; then
+      echo "  Note: This trace file may be missing GPU details."
+    fi
+  else
+    "${xtrace_exec}" --info
+  fi
+
   echo ""
   echo "## Trace #1: Accurate GPU Frame Timing Stats"
   echo ""
-  "${xtrace_exec}" --no-open --md-output -t 5s --gpu1 --frame-stats --surface-stats --top --drop-stats
+  "${xtrace_exec}" "${trace1_args[@]}"
   echo ""
   echo "## Trace #2: Detailed GPU Counters, Tiling and Binning Info"
   echo ""
-  "${xtrace_exec}" --no-open --md-output -t 5s --gpu2 --counters --no-frame-stats --surface-stats --counter-stats
+  "${xtrace_exec}" "${trace2_args[@]}"
   exit 0
 fi
 
