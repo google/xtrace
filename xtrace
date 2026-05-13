@@ -1744,7 +1744,7 @@ adb wait-for-device
 # Now using inotifyd instead of attach, to be sure the file is fully written.
 # Android 16 changed the syntax from ::w to :w
 inotify_setup='inotify_suffix="::w"; [[ $(getprop ro.build.version.release) -ge 16 ]] && inotify_suffix=":w"'
-adb shell "${inotify_setup}; inotifyd - ${android_trace}\$inotify_suffix | head -n0 & kill ${perfetto_pid} ; wait ; \
+adb shell "${inotify_setup}; inotifyd - ${android_trace}\$inotify_suffix | head -n0 & sleep 1 ; kill ${perfetto_pid} ; wait ; \
     pkill -x ${gpu_counter_producer}"
 
 if ! adb pull ${android_trace} ${output_file} > /dev/null 2>&1; then
