@@ -221,12 +221,14 @@ show_help_and_exit() {
   echo "  TopThread1 TopThread2: The top two threads by CPU usage."
   echo "  CpuPct1 CpuPct2: Percent CPU core usage of the top two threads."
   echo ""
-  echo "Special categories:"
+  echo "Category handling:"
+  echo "  cat.*: Perfetto category (\"cat.\" prefix is removed)"
+  echo "  */*: ftrace category (use cat.*/* to specify a Perfetto category)"
   echo "  chrome.*: Chrome trace categories (\"chrome.\" prefix is removed)"
   echo "  Chrome gfx: chrome.ui chrome.cc chrome.gpu"
-  echo "  Android gfx: gfx view wm"
+  echo "  Android Atrace gfx: gfx view wm"
   echo ""
-  echo "Available Android categories:"
+  echo "Available Android Atrace categories:"
   echo "  $(available_atrace_categories)" | tr '\n' ' '
   exit 1
 }
@@ -557,10 +559,12 @@ for (( i = 0; i < num_args; i++ )); do
     echo "warning: ignoring unknown option ${args[${i}]}"
   else
     cat="${args[${i}]}"
-    if [[ "${cat}" == */* ]]; then
-      ftrace_events+=("${cat}")
+    if [[ "${cat}" == cat.* ]]; then
+      categories+=("${cat#"cat."}")
     elif [[ "${cat}" == chrome.* ]]; then
       chrome_categories+="\\\"${cat#"chrome."}\\\","
+    elif [[ "${cat}" == */* ]]; then
+      ftrace_events+=("${cat}")
     else
       categories+=("${cat}")
     fi
@@ -831,7 +835,7 @@ write_config_file() {
     <(echo "$(available_atrace_categories)" | tr ' ' '\n' | sort ) \
     <(echo "${categories[@]}" | tr ' ' '\n' | sort)))
 
-  title_args+=("${categories[@]}")
+  title_args+=("${categories[@]//\//_}")
 
   # Perfetto added --version arg recently, which prints (eg):
   #   "Perfetto v24.2-7cb228c16 (7cb228c16d69aee297a106ad3ccc7461fa0b8045)"
