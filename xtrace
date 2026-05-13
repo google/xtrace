@@ -995,7 +995,7 @@ EOL
   fi
 
   cat >>"${config_filepath}" <<EOL
-      meminfo_period_ms: 10
+      meminfo_period_ms: 1000
       meminfo_counters: MEMINFO_MEM_TOTAL
       meminfo_counters: MEMINFO_MEM_FREE
       meminfo_counters: MEMINFO_BUFFERS
