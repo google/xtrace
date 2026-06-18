@@ -1564,7 +1564,7 @@ run_counters_sql () {
     search_string="\\/\\* template filter active \\*\\/ 0 = 0"
     sed -i -e "s@${search_string}@1 = 0@g" "${temp_sql_path}"
 
-    search_string="\\/\\* template target filter processing \\*\\/ name IN ('Binning', 'Render', 'Dispatch', 'Compute')"
+    search_string="\\/\\* template target filter processing \\*\\/ name IN ('Binning', 'Render', 'Dispatch')"
     sed -i -e "s@${search_string}@name = 'Surface' ${sql_filter}@g" "${temp_sql_path}"
   fi
 
