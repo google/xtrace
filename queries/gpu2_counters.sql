@@ -20,7 +20,7 @@ WITH
   target_process AS (
     SELECT upid
     FROM gpu_slice
-    WHERE /* template target filter processing */ name IN ('Binning', 'Render', 'Dispatch', 'Compute')
+    WHERE /* template target filter processing */ name IN ('Binning', 'Render', 'Dispatch')
     GROUP BY upid
     ORDER BY COUNT(*) DESC
     LIMIT 1
@@ -57,7 +57,7 @@ WITH
       CASE
         WHEN name GLOB '*Binning*' THEN 'Binning'
         WHEN name GLOB '*Render*' THEN 'Render'
-        WHEN (name GLOB '*Compute*' OR name GLOB '*Dispatch*') THEN 'Dispatch'
+        WHEN name GLOB '*Dispatch*' THEN 'Dispatch'
         ELSE 'Other'
       END AS stage_type
     FROM gpu_slice
