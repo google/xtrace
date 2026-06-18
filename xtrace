@@ -135,7 +135,8 @@ show_help_and_exit() {
   echo "  [-p /path/to/perfetto]   Path to perfetto tool if it is not in \$PATH"
   echo "  [-c /path/to/config]     Use existing textproto config file instead of generating it"
   echo "  [-i <period_ms>]         Incremental update period in ms"
-  echo "  [--screenshot]           [XR] Capture a raw screenshot alongside the trace"
+  echo "  [--screenshot]           [XR] Capture a screenshot alongside the trace"
+  ecRT "  [--raw-screenshot]       [XR] Capture a raw screenshot alongside the trace"
   ecRT "  [--lock-frequencies]     [XR] Lock CPU, GPU and DDR frequencies for more consistent measurements."
   ecRT "                           Note: Performance will be different from normal device conditions. This"
   ecRT "                            option is useful for A/B testing different CPU or GPU code to measure"
@@ -268,6 +269,7 @@ push_config=true
 use_binary_config=false
 auto_open=true
 screenshot=false
+raw_screenshot=false
 lock_frequencies=false
 lock_head=''
 enable_gpu=false
@@ -497,6 +499,8 @@ for (( i = 0; i < num_args; i++ )); do
     skip_tracing=true
   elif [[ "${args[${i}]}" = "--screenshot" ]]; then
     screenshot=true
+  elif [[ "${args[${i}]}" = "--raw-screenshot" ]]; then
+    raw_screenshot=true
   elif [[ "${args[${i}]}" = "--lock-frequencies" ]]; then
     lock_frequencies=true
   elif [[ "${args[${i}]}" = "--gpu" ]]; then
@@ -1816,13 +1820,62 @@ fi
 du -hs "${output_file}"
 autoload
 
-if [[ "${screenshot}" == true ]]; then
-  echo "Capturing screenshot..."
-  previous_raw=$(adb shell getprop cpm.raw_capture)
-  is_adb_root && adb shell setprop cpm.raw_capture true
-  adb exec-out screencap -p > "${output_file}.png"
-  is_adb_root && [[ "${previous_raw}" != true ]] && adb shell setprop cpm.raw_capture false
+cap_screenshot() {
+  local raw="$1"
+  local target_raw=false
+  local restore_raw=true
+  local log_msg="Capturing screenshot..."
+
+  if [[ "${raw}" == true ]]; then
+    target_raw=true
+    restore_raw=false
+    log_msg="Capturing raw screenshot..."
+  fi
+
+  echo "${log_msg}"
+
+  local previous_raw=$(adb shell getprop cpm.raw_capture)
+
+  local changed=false
+  if is_adb_root && [[ "${previous_raw}" != "${target_raw}" ]]; then
+    adb shell setprop cpm.raw_capture "${target_raw}"
+    changed=true
+  fi
+
+  # Check if there are multiple displays and select the one with HWC display 0
+  local display_id=""
+  local displays
+  displays=$(adb shell dumpsys SurfaceFlinger --display-id 2>/dev/null | tr -d '\r')
+  local display_count
+  display_count=$(echo "${displays}" | grep -c "^Display " || true)
+
+  if [[ ${display_count} -gt 1 ]]; then
+    local target_line
+    target_line=$(echo "${displays}" | grep "HWC display 0" || true)
+    if [[ -n "${target_line}" ]]; then
+      display_id=$(echo "${target_line}" | cut -d' ' -f2)
+    fi
+  fi
+
+  if [[ -n "${display_id}" ]]; then
+    adb exec-out screencap -d "${display_id}" -p > "${output_file}.png"
+  else
+    adb exec-out screencap -p > "${output_file}.png"
+  fi
+
+  if [[ "${changed}" == true ]]; then
+    adb shell setprop cpm.raw_capture "${restore_raw}"
+  fi
+
   du -hs "${output_file}.png"
+}
+
+if [[ "${screenshot}" == true ]]; then
+  cap_screenshot false
+fi
+
+if [[ "${raw_screenshot}" == true ]]; then
+  cap_screenshot true
 fi
 
 if [[ "${lock_frequencies}" == true ]]; then
