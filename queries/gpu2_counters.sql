@@ -17,7 +17,7 @@
 INCLUDE PERFETTO MODULE slices.with_context;
 
 WITH
-  target_process AS (
+  target_procs AS (
     SELECT upid
     FROM gpu_slice
     WHERE /* template target filter processing */ name IN ('Binning', 'Render', 'Dispatch')
@@ -28,26 +28,101 @@ WITH
   tracks_to_fix AS (
     SELECT id, name FROM gpu_counter_track
   ),
+  fixed_counters_pre AS (
+    SELECT
+      ts,
+      track_id,
+      value AS value_no_lag,
+      LAG(value) OVER (PARTITION BY track_id ORDER BY ts) AS value_lag,
+      name AS counter_name
+    FROM counter c
+    JOIN tracks_to_fix t ON c.track_id = t.id
+  ),
+  /* older drivers have an offset that we need to check for and fix */
+  need_lag_flag AS (
+    SELECT
+      CASE
+        WHEN COUNT(*) > 0 THEN 1
+        ELSE 0
+      END AS need_lag
+    FROM gpu_slice s
+    JOIN fixed_counters_pre c ON c.ts = s.ts
+    WHERE s.name IN ('Binning', 'Render', 'Dispatch')
+      AND c.counter_name = 'Clocks'
+      AND c.value_lag > 0
+  ),
   fixed_counters AS (
     SELECT
       ts,
       track_id,
-      LAG(value) OVER (PARTITION BY track_id ORDER BY ts) AS value,
-      t.name AS counter_name
-    FROM counter c
-    JOIN tracks_to_fix t ON c.track_id = t.id
+      counter_name,
+      CASE
+        WHEN (SELECT need_lag FROM need_lag_flag) = 1 THEN value_lag
+        ELSE value_no_lag
+      END AS value
+    FROM fixed_counters_pre
   ),
+  /* --- BEGIN IDENTICAL SURFACE CONSOLIDATION CTE BLOCK --- */
+  surface_slices_raw AS (
+      SELECT
+          upid,
+          ts,
+          dur,
+          arg_set_id,
+          EXTRACT_ARG(arg_set_id, 'width') AS width,
+          EXTRACT_ARG(arg_set_id, 'height') AS height,
+          EXTRACT_ARG(arg_set_id, 'numBins') AS numBins,
+          EXTRACT_ARG(arg_set_id, 'binWidth') AS binWidth,
+          EXTRACT_ARG(arg_set_id, 'binHeight') AS binHeight,
+          EXTRACT_ARG(arg_set_id, 'MSAA') AS msaa,
+          EXTRACT_ARG(arg_set_id, 'numRenderTargets') AS render_targets,
+          EXTRACT_ARG(arg_set_id, 'renderMode') AS renderMode,
+          (
+              SELECT SUM(CAST(COALESCE(int_value, string_value) AS INT))
+              FROM args
+              WHERE arg_set_id = gpu_slice.arg_set_id
+                AND key GLOB 'Render Target * BPP'
+          ) AS render_target_bpp,
+          CAST(COALESCE(NULLIF(NULLIF(EXTRACT_ARG(arg_set_id, 'render_pass'), '0'), 0),
+                        EXTRACT_ARG(arg_set_id, 'surfaceID')) AS TEXT) AS surface_key
+      FROM gpu_slice
+      WHERE name = 'Surface'
+        AND upid IN (SELECT upid FROM target_procs)
+  ),
+  surface_slices_with_count AS (
+      SELECT
+          *,
+          COUNT(*) OVER (PARTITION BY upid, surface_key) AS key_count
+      FROM surface_slices_raw
+  ),
+  surface_slices AS (
+      SELECT
+          *,
+          CASE
+              WHEN key_count = 1 THEN
+                  FIRST_VALUE(surface_key) OVER (
+                      PARTITION BY upid, key_count, width, height, msaa, render_target_bpp, binWidth, binHeight, numBins
+                      ORDER BY ts
+                  )
+              ELSE surface_key
+          END AS consolidated_key
+      FROM surface_slices_with_count
+  ),
+  /* --- END IDENTICAL SURFACE CONSOLIDATION CTE BLOCK --- */
   all_surfaces AS (
     SELECT
       ts,
-      EXTRACT_ARG(arg_set_id, 'width') AS width,
-      EXTRACT_ARG(arg_set_id, 'height') AS height,
-      EXTRACT_ARG(arg_set_id, 'binWidth') AS binWidth,
-      EXTRACT_ARG(arg_set_id, 'binHeight') AS binHeight,
-      CASE WHEN 1=1 /* template surface filter */ THEN 1 ELSE 0 END AS is_selected
-    FROM gpu_slice
-    WHERE upid IN (SELECT upid FROM target_process)
-      AND name = 'Surface'
+      width,
+      height,
+      binWidth,
+      binHeight,
+      CASE WHEN consolidated_key = (
+        SELECT consolidated_key
+        FROM surface_slices
+        WHERE 1=1 /* template surface filter */
+        LIMIT 1
+      ) THEN 1 ELSE 0 END AS is_selected
+    FROM surface_slices
   ),
   gpu_stages AS (
     SELECT
@@ -61,7 +136,7 @@ WITH
         ELSE 'Other'
       END AS stage_type
     FROM gpu_slice
-    WHERE upid IN (SELECT upid FROM target_process)
+    WHERE upid IN (SELECT upid FROM target_procs)
   ),
   combined_events AS (
     SELECT ts, 'surface' as type, is_selected as val, width, height, binWidth, binHeight FROM all_surfaces
@@ -75,8 +150,8 @@ WITH
     FROM combined_events
   ),
   group_selection AS (
-    SELECT 
-      surface_group_id, 
+    SELECT
+      surface_group_id,
       MAX(val) as is_selected,
       MAX(width) as width,
       MAX(height) as height,
@@ -175,14 +250,14 @@ WITH
     FROM stage_counters
     WHERE counter_name = 'Clocks'
     UNION ALL
-    SELECT 
+    SELECT
       '$$$ Resolution Width' AS counter_name,
       AVG(CASE WHEN stage_type = 'Binning' THEN binWidth END) as Binning,
       AVG(CASE WHEN stage_type = 'Render' THEN width END) as Render,
       0 as Dispatch
     FROM filtered_stages
     UNION ALL
-    SELECT 
+    SELECT
       '$$$ Resolution Height' AS counter_name,
       AVG(CASE WHEN stage_type = 'Binning' THEN binHeight END) as Binning,
       AVG(CASE WHEN stage_type = 'Render' THEN height END) as Render,
