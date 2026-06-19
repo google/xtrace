@@ -1529,11 +1529,11 @@ run_counters_sql () {
   if [[ -n "${gpu_counter_stats_filter}" ]]; then
     sql_filter=""
     if [[ "${gpu_counter_stats_filter}" == *,* ]]; then
-      # eg: --counter-stats=com.company.app,1/2
+      # eg: --counter-stats=com.company.app,12345
       app_pattern="${gpu_counter_stats_filter%,*}"
       idx_pattern="${gpu_counter_stats_filter#*,}"
-    elif [[ "${gpu_counter_stats_filter}" == */* ]]; then
-      # eg: --counter-stats=1/2
+    elif [[ "${gpu_counter_stats_filter}" =~ ^[0-9]+$ ]] || [[ "${gpu_counter_stats_filter}" =~ ^0x[0-9a-fA-F]+$ ]]; then
+      # eg: --counter-stats=12345 or --counter-stats=0xab12
       app_pattern=""
       idx_pattern="${gpu_counter_stats_filter}"
     else
@@ -1552,10 +1552,7 @@ run_counters_sql () {
     fi
 
     if [[ -n "${idx_pattern}" ]]; then
-      idx="${idx_pattern%/*}"
-      total="${idx_pattern#*/}"
-      idx=$((idx - 1))
-      sql_filter+=" AND EXTRACT_ARG(arg_set_id, 'name') GLOB 'Surface *' AND CAST(SUBSTR(EXTRACT_ARG(arg_set_id, 'name'), 9) AS INT) % ${total} = (${idx}%${total}) "
+      sql_filter+=" AND CAST(COALESCE(NULLIF(NULLIF(EXTRACT_ARG(arg_set_id, 'render_pass'), '0'), 0), EXTRACT_ARG(arg_set_id, 'surfaceID')) AS TEXT) = '${idx_pattern}' "
     fi
 
     search_string="\\/\\* template surface filter \\*\\/"

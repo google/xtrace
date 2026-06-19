@@ -16,122 +16,15 @@
 
 INCLUDE PERFETTO MODULE slices.with_context;
 
-CREATE TABLE IF NOT EXISTS gpu_pids AS
+CREATE TABLE IF NOT EXISTS target_procs AS
 SELECT DISTINCT upid FROM gpu_slice;
 
-WITH gpu_events AS (
-    /* --gpu1 --gpu2 Surface events */
-    SELECT gs.upid, gs.ts, gs.dur
-    FROM gpu_slice gs
-    WHERE
-        /* TODO: subtract Preempt events */
-        gs.name IN ('Surface')
-),
-app_frames AS (
-    SELECT
-        EXTRACT_ARG(arg_set_id, 'debug.sourcePid') AS pid,
-        ts
-    FROM slice
-    WHERE (name = 'GPU' AND category = 'cpm' AND pid IS NOT NULL)
-),
-app_frames2 AS (
-    SELECT
-        EXTRACT_ARG(arg_set_id, 'debug.sourcePid') AS pid,
-        ts
-    FROM slice
-    /* Newer traces have one ready event per app frame */
-    WHERE (name = 'ready' AND category = 'cpm' AND pid IS NOT NULL)
-),
-cpu_frames_pre1 AS (
-    /* CPM compositor frames */
-    SELECT upid, ts
-    FROM thread_slice
-    WHERE name = 'frame' AND category = 'cpm'
-    UNION ALL
-    /* XR app frames */
-    SELECT upid, ts
-    FROM app_frames2
-    JOIN process USING (pid)
-),
-cpu_frames_pre2 AS (
-    SELECT upid, ts
-    FROM cpu_frames_pre1
-    UNION ALL
-    /* Backwards compat XR app frames */
-    SELECT process.upid, app_frames.ts
-    FROM app_frames
-    JOIN process USING (pid)
-    LEFT JOIN cpu_frames_pre1 existing_frames ON process.upid = existing_frames.upid
-    WHERE existing_frames.upid IS NULL
-),
-cpu_frames_pre3 AS (
-    SELECT upid, ts
-    FROM cpu_frames_pre2
-    UNION ALL
-    /* 2D app frames */
-    SELECT thread_slice.upid, thread_slice.ts
-    FROM thread_slice
-    LEFT JOIN cpu_frames_pre2 existing_frames ON thread_slice.upid = existing_frames.upid
-    WHERE
-        existing_frames.upid IS NULL
-        /* Alternate app frame events.
-           This only works if a single process uses only one of these. */
-        AND thread_slice.name IN (
-            'oxr_xrEndFrame', /* OpenXR event from ATRACE gfx category */
-            'SkiaRenderer::SwapBuffers', /* Chrome compositor frame */
-            'Choreographer#scheduleVsyncLocked') /* Android app frame */
-),
-cpu_frames AS (
-    SELECT upid, ts
-    FROM cpu_frames_pre3
-    UNION ALL
-    /* Any other GPU usage by a process that does not have a known CPU frame
-       gets 1 CPU frame per GPU slice. */
-    SELECT ge.upid, ge.ts
-    FROM gpu_events ge
-    LEFT JOIN cpu_frames_pre3 existing_frames ON ge.upid = existing_frames.upid
-    WHERE existing_frames.upid IS NULL
-),
-combined_extents AS (
-    SELECT
-        upid,
-        MIN(ts) AS min_ts,
-        MAX(ts) AS max_ts
-    FROM cpu_frames
-    GROUP BY upid
-    UNION ALL
-    SELECT
-        upid,
-        MIN(ts) AS min_ts,
-        MAX(ts) AS max_ts
-    FROM gpu_events
-    GROUP BY upid
-    /* Don't clip by GPU events if there are only a few: */
-    HAVING COUNT(ts) > 8
-),
-ts_extents AS (
-    SELECT
-        upid,
-        MAX(min_ts) + 1000000 AS start_ts,
-        MIN(max_ts) - 1000000 AS end_ts
-    FROM combined_extents
-    GROUP BY upid
-),
-frame_counts AS (
-    SELECT
-        upid,
-        MAX(1, COUNT(cpu_frames.ts)) AS count
-    FROM ts_extents
-    JOIN cpu_frames USING (upid)
-    WHERE cpu_frames.ts BETWEEN start_ts AND end_ts
-    GROUP BY upid
-),
-
-surface_slices AS (
+WITH surface_slices_raw AS (
     SELECT
         upid,
         ts,
         dur,
+        arg_set_id,
         EXTRACT_ARG(arg_set_id, 'width') AS width,
         EXTRACT_ARG(arg_set_id, 'height') AS height,
         EXTRACT_ARG(arg_set_id, 'numBins') AS numBins,
@@ -146,19 +39,37 @@ surface_slices AS (
             WHERE arg_set_id = gpu_slice.arg_set_id
               AND key GLOB 'Render Target * BPP'
         ) AS render_target_bpp,
-        (row_number() OVER (PARTITION BY upid ORDER BY ts) - 1) %
-            MAX(1, (SELECT COUNT(*) FROM gpu_slice g2 WHERE g2.upid = gpu_slice.upid AND name = 'Surface') /
-                   MAX(1, (SELECT count FROM frame_counts WHERE frame_counts.upid = gpu_slice.upid))) + 1 AS surface_index
+        CAST(COALESCE(NULLIF(NULLIF(EXTRACT_ARG(arg_set_id, 'render_pass'), '0'), 0),
+                      EXTRACT_ARG(arg_set_id, 'surfaceID')) AS TEXT) AS surface_key
     FROM gpu_slice
     WHERE name = 'Surface'
-      AND upid IN (SELECT upid FROM gpu_pids)
+      AND upid IN (SELECT upid FROM target_procs)
+),
+surface_slices_with_count AS (
+    SELECT
+        *,
+        COUNT(*) OVER (PARTITION BY upid, surface_key) AS key_count
+    FROM surface_slices_raw
+),
+surface_slices AS (
+    SELECT
+        *,
+        CASE
+            WHEN key_count = 1 THEN
+                FIRST_VALUE(surface_key) OVER (
+                    PARTITION BY upid, key_count, width, height, msaa, render_target_bpp, binWidth, binHeight, numBins
+                    ORDER BY ts
+                )
+            ELSE surface_key
+        END AS consolidated_key
+    FROM surface_slices_with_count
 ),
 gpu_stages AS (
     SELECT
       upid, ts, dur,
       name AS stage_type
     FROM gpu_slice
-    WHERE upid IN (SELECT upid FROM gpu_pids)
+    WHERE upid IN (SELECT upid FROM target_procs)
       AND name IN ('Binning', 'Render', 'Preempt')
 ),
 combined_events AS (
@@ -196,7 +107,7 @@ filtered_stages AS (
 )
 SELECT
     process.name AS ProcessName,
-    surface_slices.surface_index || '/' || (MAX(surface_slices.surface_index) OVER (PARTITION BY surface_slices.upid)) AS SurfaceID,
+    surface_slices.consolidated_key AS SurfaceID,
     CAST(AVG(surface_slices.width) AS INT) AS W,
     CAST(AVG(surface_slices.height) AS INT) AS H,
     CAST(AVG(surface_slices.msaa) AS INT) AS MSAA,
@@ -215,5 +126,5 @@ SELECT
 FROM surface_slices
 LEFT JOIN filtered_stages ON surface_slices.upid = filtered_stages.upid AND surface_slices.ts = filtered_stages.surface_ts
 JOIN process ON process.upid = surface_slices.upid
-GROUP BY surface_slices.upid, surface_slices.surface_index
+GROUP BY surface_slices.upid, surface_slices.consolidated_key
 ORDER BY SUM(surface_slices.dur) DESC;
