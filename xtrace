@@ -1330,8 +1330,7 @@ EOL
 }
 
 if [[ "${is_local}" == true ]]; then
-
-  traced_running=$(ps --summary -W | grep traced)
+  traced_running=$(ps -e | grep '[t]raced')
 
   if [[ -z "${traced_running}" ]]; then
     echo "Starting trace service (traced) in background..."
