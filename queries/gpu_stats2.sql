@@ -349,7 +349,7 @@ xr_frames2 AS (
         ts
     FROM slice
     /* Newer traces have one ready event per app frame */
-    WHERE (name = 'ready' AND category = 'cpm' AND pid IS NOT NULL)
+    WHERE (name = 'appFrame' AND category = 'cpm' AND pid IS NOT NULL)
 ),
 gpu_dims AS (
     SELECT
