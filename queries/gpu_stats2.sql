@@ -336,20 +336,36 @@ global_gpu_stats AS (
         SUM(gpu_frequency_dur.dur) / 1e9 AS total_dur
     FROM gpu_frequency_dur
 ),
-xr_frames AS (
+xr_frames_ready AS (
     SELECT
         EXTRACT_ARG(arg_set_id, 'debug.sourcePid') AS pid,
         ts
     FROM slice
-    WHERE (name = 'GPU' AND category = 'cpm' AND pid IS NOT NULL)
+    WHERE name = 'ready' AND category = 'cpm' AND pid IS NOT NULL
 ),
-xr_frames2 AS (
+xr_frames_appFrame AS (
     SELECT
         EXTRACT_ARG(arg_set_id, 'debug.sourcePid') AS pid,
         ts
     FROM slice
-    /* Newer traces have one ready event per app frame */
-    WHERE (name = 'appFrame' AND category = 'cpm' AND pid IS NOT NULL)
+    WHERE name = 'appFrame' AND category = 'cpm' AND pid IS NOT NULL
+),
+xr_frames_gpu AS (
+    SELECT
+        EXTRACT_ARG(arg_set_id, 'debug.sourcePid') AS pid,
+        ts
+    FROM slice
+    WHERE name = 'GPU' AND category = 'cpm' AND pid IS NOT NULL
+),
+xr_frames AS (
+    SELECT pid, ts FROM xr_frames_ready
+    UNION ALL
+    SELECT pid, ts FROM xr_frames_appFrame
+        WHERE NOT EXISTS (SELECT 1 FROM xr_frames_ready)
+    UNION ALL
+    SELECT pid, ts FROM xr_frames_gpu
+        WHERE NOT EXISTS (SELECT 1 FROM xr_frames_ready)
+          AND NOT EXISTS (SELECT 1 FROM xr_frames_appFrame)
 ),
 gpu_dims AS (
     SELECT
@@ -407,29 +423,18 @@ cpu_frames_pre1 AS (
     WHERE name = 'frame' AND category = 'cpm'
     UNION ALL
     /* XR app frames */
-    SELECT upid, ts
-    FROM xr_frames2
-    JOIN process USING (pid)
-),
-cpu_frames_pre2 AS (
-    SELECT upid, ts
-    FROM cpu_frames_pre1
-    UNION ALL
-    /* Backwards compat XR app frames */
     SELECT process.upid, xr_frames.ts
     FROM xr_frames
     JOIN process USING (pid)
-    LEFT JOIN cpu_frames_pre1 existing_frames ON process.upid = existing_frames.upid
-    WHERE existing_frames.upid IS NULL
 ),
 cpu_frames_pre3 AS (
     SELECT upid, ts
-    FROM cpu_frames_pre2
+    FROM cpu_frames_pre1
     UNION ALL
     /* Backup xr app frame events if CPM is missing them (requires atrace gfx). */
     SELECT thread_slice.upid, thread_slice.ts
     FROM thread_slice
-    LEFT JOIN cpu_frames_pre2 existing_frames ON thread_slice.upid = existing_frames.upid
+    LEFT JOIN cpu_frames_pre1 existing_frames ON thread_slice.upid = existing_frames.upid
     WHERE
         existing_frames.upid IS NULL
         AND thread_slice.name = 'oxr_xrEndFrame'
