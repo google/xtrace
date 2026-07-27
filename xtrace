@@ -677,8 +677,8 @@ if [[ "${is_local}" == false ]] && [[ "${from_file}" == false ]]; then
   do_stop_start=false
 
   if [[ "${enable_gpu}" == true ]]; then
-    adb shell "echo 1 > ${adreno_perfcounter_file}"
-    adb shell setprop debug.graphics.gpu.profiler.perfetto 1
+    adb wait-for-device shell "echo 1 > ${adreno_perfcounter_file}"
+    adb wait-for-device shell setprop debug.graphics.gpu.profiler.perfetto 1
     if [[ "${enable_gpu_restart_services}" == true ]]; then
       do_stop_start=true
     fi
@@ -691,7 +691,7 @@ if [[ "${is_local}" == false ]] && [[ "${from_file}" == false ]]; then
   fi
 
   if [[ "${disable_gpu}" == true ]]; then
-    adb shell setprop debug.graphics.gpu.profiler.perfetto 0
+    adb wait-for-device shell setprop debug.graphics.gpu.profiler.perfetto 0
     if [[ "${disable_gpu_restart_services}" == true ]]; then
       do_stop_start=true
     fi
