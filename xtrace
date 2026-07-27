@@ -367,6 +367,55 @@ notquiet() {
   fi
 }
 
+append_trace_attribute() {
+  local key="$1"
+  local val="$2"
+  local trace_file="$3"
+
+  if [[ -f "${trace_file}" ]] && [[ -n "${val}" ]]; then
+    ${python} -c '
+import sys
+import struct
+
+def make_varint(val):
+    out = []
+    while val >= 0x80:
+        out.append(struct.pack("B", (val & 0x7F) | 0x80))
+        val >>= 7
+    out.append(struct.pack("B", val & 0x7F))
+    return b"".join(out)
+
+def make_length_delimited(field_num, data):
+    tag = (field_num << 3) | 2
+    return make_varint(tag) + make_varint(len(data)) + data
+
+def get_bytes(s):
+    if isinstance(s, bytes):
+        return s
+    return s.encode("utf-8")
+
+key_bytes = get_bytes(sys.argv[1])
+val_str = sys.argv[2]
+
+if val_str.isdigit():
+    val_int = int(val_str)
+    # Tag for field 2 (long_value) is (2 << 3) | 0 = 16 (0x10)
+    val_bytes = make_varint(val_int)
+    attr_data = make_length_delimited(1, key_bytes) + struct.pack("B", 16) + val_bytes
+else:
+    val_bytes = get_bytes(val_str)
+    attr_data = make_length_delimited(1, key_bytes) + make_length_delimited(3, val_bytes)
+
+trace_attr_data = make_length_delimited(1, attr_data)
+packet_data = make_length_delimited(126, trace_attr_data)
+trace_data = make_length_delimited(1, packet_data)
+
+output = getattr(sys.stdout, "buffer", sys.stdout)
+output.write(trace_data)
+' "${key}" "${val}" >> "${trace_file}"
+  fi
+}
+
 # Print dashed line matching length of first line of $1
 dashed_header_line() {
   local first_line=$(head -n 1 <<< "$1")
@@ -458,7 +507,7 @@ for (( i = 0; i < num_args; i++ )); do
     output_args_file="${args[${i}]}"
   elif [[ "${args[${i}]}" = "--info" ]]; then
     adb shell getprop ro.build.description
-    adb shell dumpsys SurfaceFlinger | grep GLES
+    adb shell dumpsys SurfaceFlinger | grep GLES\:
     skip_tracing=true
   elif [[ "${args[${i}]}" = "--enable-gpu" ]]; then
     enable_gpu=true
@@ -776,6 +825,18 @@ if [[ "${is_local}" == false ]] && [[ "${from_file}" == false ]]; then
       is_kgsl=true
     else
       is_kgsl=false
+    fi
+    gpu_driver_info=$(adb shell dumpsys SurfaceFlinger | grep GLES\: | sed 's/^GLES: //' | tr -d '\r\n')
+    if [[ "${gpu_driver_info}" == *Adreno* ]]; then
+      adreno_driver_version=$(${python} -c '
+import sys, re
+m = re.search(r"V@(\d+)(?:\.(\d+))?(?:\.(\d+))?", sys.argv[1])
+if m:
+    major = int(m.group(1))
+    minor = int(m.group(2)) if m.group(2) is not None else 0
+    patch = int(m.group(3)) if m.group(3) is not None else 0
+    print(major * 1000000 + minor * 1000 + patch)
+' "${gpu_driver_info}")
     fi
   fi
 
@@ -1814,6 +1875,10 @@ if ! adb pull ${android_trace} ${output_file} > /dev/null 2>&1; then
         || { echo "error: failed to adb pull ${android_trace} ${output_file}" >&2 ; exit 1; }
   fi
 fi
+[[ -n "${gpu_driver_info}" ]] &&
+    append_trace_attribute "gpu_driver_info" "${gpu_driver_info}" "${output_file}"
+[[ -n "${adreno_driver_version}" ]] &&
+    append_trace_attribute "adreno_driver_version" "${adreno_driver_version}" "${output_file}"
 du -hs "${output_file}"
 autoload
 
