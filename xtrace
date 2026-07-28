@@ -111,9 +111,10 @@ show_help_and_exit() {
   echo "  [--no-surface-stats]     Do not print GPU surface stats"
   echo "  [--drop-stats]           Print frame drop statistics"
   echo "  [--counter-stats]        Print detailed GPU counter stats for a target process and surface."
-  echo "                           This requires a trace with --gpu2 --counters."
-  echo "                           Usage: --counter-stats[=<app_name>,<surface_index>/<total_surfaces>]"
-  echo "                           Examples: --counter-stats=com.company.app,1/2 or --counter-stats=2/2"
+  echo "                           This requires a trace with --gpu2 --counters. See --surface-stats "
+  echo "                           for SurfaceID values."
+  echo "                           Usage: --counter-stats[=<SurfaceID>] or --counter-stats[=<app_name>]"
+  echo "                           Examples: --counter-stats=com.company.app or --counter-stats=123-abc"
   echo "                             --counter-stats alone auto-selects the most costly GPU surface"
   echo "  [--no-counter-stats]     Do not print GPU counter stats"
   echo "  [--top]                  Print the top CPU usage by process"
@@ -1600,8 +1601,8 @@ run_counters_sql () {
       # eg: --counter-stats=com.company.app,12345
       app_pattern="${gpu_counter_stats_filter%,*}"
       idx_pattern="${gpu_counter_stats_filter#*,}"
-    elif [[ "${gpu_counter_stats_filter}" =~ ^[0-9]+$ ]] || [[ "${gpu_counter_stats_filter}" =~ ^0x[0-9a-fA-F]+$ ]]; then
-      # eg: --counter-stats=12345 or --counter-stats=0xab12
+    elif [[ "${gpu_counter_stats_filter}" =~ ^[0-9a-fA-F\-]+$ ]]; then
+      # eg: --counter-stats=12345-ab12
       app_pattern=""
       idx_pattern="${gpu_counter_stats_filter}"
     else
@@ -1620,7 +1621,9 @@ run_counters_sql () {
     fi
 
     if [[ -n "${idx_pattern}" ]]; then
-      sql_filter+=" AND CAST(COALESCE(NULLIF(NULLIF(EXTRACT_ARG(arg_set_id, 'render_pass'), '0'), 0), EXTRACT_ARG(arg_set_id, 'surfaceID')) AS TEXT) = '${idx_pattern}' "
+      sql_filter+=" AND CAST(COALESCE(SUBSTR(EXTRACT_ARG(arg_set_id, 'context_id'), -8) || '-', '') || \
+                             COALESCE(SUBSTR(NULLIF(NULLIF(EXTRACT_ARG(arg_set_id, 'render_pass'), '0'), 0), -9), \
+                                      SUBSTR(EXTRACT_ARG(arg_set_id, 'surfaceID'), -8)) AS TEXT) = '${idx_pattern}' "
     fi
 
     search_string="\\/\\* template surface filter \\*\\/"
