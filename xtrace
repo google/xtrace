@@ -214,6 +214,7 @@ show_help_and_exit() {
   echo '  Bins: Number of bins (tiles).'
   echo '  BinW, BinH: Individual tile resolution.'
   echo '  RenderMode: GPU rendering mode.'
+  echo '  API: Detected graphics API (best effort).'
   echo ""
   echo '--counter-stats output:'
   echo '  Counter stats data is output for a specific surface* and separated by render stages.'

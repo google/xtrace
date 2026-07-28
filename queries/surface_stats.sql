@@ -33,6 +33,10 @@ WITH surface_slices_raw AS (
         EXTRACT_ARG(arg_set_id, 'MSAA') AS msaa,
         EXTRACT_ARG(arg_set_id, 'numRenderTargets') AS render_targets,
         EXTRACT_ARG(arg_set_id, 'renderMode') AS renderMode,
+        CASE
+            WHEN NULLIF(NULLIF(EXTRACT_ARG(arg_set_id, 'render_pass'), '0'), 0) IS NULL THEN 'GLES'
+            ELSE 'Vk'
+        END AS api,
         (
             SELECT SUM(MAX(0, CAST(COALESCE(int_value, string_value) AS INT)))
             FROM args
@@ -136,7 +140,8 @@ SELECT
     CAST(ROUND(AVG(surface_slices.numBins)) AS INT) AS Bins,
     CAST(ROUND(AVG(surface_slices.binWidth)) AS INT) AS BinW,
     CAST(ROUND(AVG(surface_slices.binHeight)) AS INT) AS BinH,
-    MAX(surface_slices.renderMode) AS RenderMode
+    MAX(surface_slices.renderMode) AS RenderMode,
+    MAX(surface_slices.api) AS API
 FROM surface_slices
 LEFT JOIN filtered_stages ON surface_slices.upid = filtered_stages.upid AND surface_slices.ts = filtered_stages.surface_ts
 JOIN process ON process.upid = surface_slices.upid
