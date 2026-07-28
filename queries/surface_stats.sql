@@ -70,7 +70,9 @@ gpu_stages AS (
       name AS stage_type
     FROM gpu_slice
     WHERE upid IN (SELECT upid FROM target_procs)
-      AND name IN ('Binning', 'Render', 'Preempt')
+      AND name IN ('Binning', 'Render', 'Preempt',
+                   'GMEM Store Color', 'GMEM Store Depth/Stencil',
+                   'GMEM Load Color', 'GMEM Load Depth/Stencil')
 ),
 combined_events AS (
     SELECT upid, ts, 'surface' as type, ts as surface_ts, NULL as stage_type, 0 as dur
@@ -99,7 +101,12 @@ filtered_stages AS (
       SUM(CASE WHEN o.stage_type = 'Binning' THEN o.dur ELSE 0 END) as bin_dur,
       SUM(CASE WHEN o.stage_type = 'Render' THEN o.dur ELSE 0 END) as render_dur,
       SUM(CASE WHEN o.stage_type = 'Preempt' THEN o.dur ELSE 0 END) as preempt_dur,
-      MAX(CASE WHEN o.stage_type = 'Render' THEN o.dur ELSE NULL END) as max_render_dur
+      MAX(CASE WHEN o.stage_type = 'Render' THEN o.dur ELSE NULL END) as max_render_dur,
+      SUM(CASE WHEN o.stage_type = 'Render' THEN 1 ELSE 0 END) as render_count,
+      SUM(CASE WHEN o.stage_type = 'GMEM Store Color' THEN 1 ELSE 0 END) as store_color_count,
+      SUM(CASE WHEN o.stage_type = 'GMEM Store Depth/Stencil' THEN 1 ELSE 0 END) as store_depth_count,
+      SUM(CASE WHEN o.stage_type = 'GMEM Load Color' THEN 1 ELSE 0 END) as load_color_count,
+      SUM(CASE WHEN o.stage_type = 'GMEM Load Depth/Stencil' THEN 1 ELSE 0 END) as load_depth_count
     FROM ordered_events o
     JOIN group_selection g ON o.surface_group_id = g.surface_group_id AND o.upid = g.upid
     WHERE o.type = 'stage' AND g.surface_group_id > 0
@@ -108,20 +115,24 @@ filtered_stages AS (
 SELECT
     process.name AS ProcessName,
     surface_slices.consolidated_key AS SurfaceID,
-    CAST(AVG(surface_slices.width) AS INT) AS W,
-    CAST(AVG(surface_slices.height) AS INT) AS H,
-    CAST(AVG(surface_slices.msaa) AS INT) AS MSAA,
-    CAST(AVG(surface_slices.render_targets) AS INT) AS RTs,
-    CAST(AVG(surface_slices.render_target_bpp) AS INT) AS RTBPP,
+    CAST(ROUND(AVG(surface_slices.width)) AS INT) AS W,
+    CAST(ROUND(AVG(surface_slices.height)) AS INT) AS H,
+    CAST(ROUND(AVG(surface_slices.msaa)) AS INT) AS MSAA,
+    CAST(ROUND(AVG(surface_slices.render_targets)) AS INT) AS RTs,
+    CAST(ROUND(AVG(surface_slices.render_target_bpp)) AS INT) AS RTBPP,
     printf('%.3f', (SUM(surface_slices.dur) - COALESCE(SUM(filtered_stages.preempt_dur), 0)) / 1000000.0 / MAX(1, COUNT(*))) AS GpuMSPF,
     printf('%.3f', MAX(surface_slices.dur - COALESCE(filtered_stages.preempt_dur, 0)) / 1000000.0) AS GpuMaxMS,
     printf('%.3f', COALESCE(SUM(filtered_stages.bin_dur), 0) / 1000000.0 / MAX(1, COUNT(*))) AS BinMSPF,
     printf('%.3f', COALESCE(SUM(filtered_stages.render_dur), 0) / 1000000.0 / MAX(1, COUNT(*))) AS RenderMSPF,
     printf('%.3f', COALESCE(MAX(filtered_stages.max_render_dur), 0) / 1000000.0) AS RenderMaxMS,
+    CAST(ROUND(CAST(SUM(filtered_stages.store_color_count) AS FLOAT) / NULLIF(SUM(filtered_stages.render_count), 0)) AS INT) AS CSt,
+    CAST(ROUND(CAST(SUM(filtered_stages.store_depth_count) AS FLOAT) / NULLIF(SUM(filtered_stages.render_count), 0)) AS INT) AS DSt,
+    CAST(ROUND(CAST(SUM(filtered_stages.load_color_count) AS FLOAT) / NULLIF(SUM(filtered_stages.render_count), 0)) AS INT) AS CLd,
+    CAST(ROUND(CAST(SUM(filtered_stages.load_depth_count) AS FLOAT) / NULLIF(SUM(filtered_stages.render_count), 0)) AS INT) AS DLd,
     COUNT(*) AS Frames,
-    CAST(AVG(surface_slices.numBins) AS INT) AS Bins,
-    CAST(AVG(surface_slices.binWidth) AS INT) AS BinW,
-    CAST(AVG(surface_slices.binHeight) AS INT) AS BinH,
+    CAST(ROUND(AVG(surface_slices.numBins)) AS INT) AS Bins,
+    CAST(ROUND(AVG(surface_slices.binWidth)) AS INT) AS BinW,
+    CAST(ROUND(AVG(surface_slices.binHeight)) AS INT) AS BinH,
     MAX(surface_slices.renderMode) AS RenderMode
 FROM surface_slices
 LEFT JOIN filtered_stages ON surface_slices.upid = filtered_stages.upid AND surface_slices.ts = filtered_stages.surface_ts
