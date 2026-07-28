@@ -128,6 +128,8 @@ show_help_and_exit() {
   echo "  [--perf-dump]            Trace the device and report comprehensive performance stats along with"
   echo "                           instructions for interpreting them. This output can be piped to an AI chat"
   echo "                           bot to help pinpoint performance problems."
+  echo "  [--sampling[=<proc>]]    Sample CPU callstacks for process <proc> (default is active app)"
+  echo "  [--sampling-freq <freq>] CPU callstack sampling frequency in Hz (default: 100)"
   echo "  [--local]                Trace local OS instead of adb device (requires perfetto instrumentation)."
   echo "  [-t <duration_ms>]       Duration to trace (default is until Ctrl-C). Also supports h/m/s suffix:"
   echo "                           Examples: \"1m5s\" (1 minute + 5 seconds) or \"300\" (300 ms)"
@@ -346,6 +348,8 @@ is_quiet=false
 kill_sleeper=false
 wake_seconds=''
 perf_dump=false
+sampling_target=''
+sampling_freq=100
 
 # See /vendor/bin/gpu_counter_producer or /system/bin/gpu_counter_producer on supported devices.
 gpu_counter_producer="gpu_counter_producer"
@@ -353,6 +357,16 @@ gpu_trace_metrics_path="${data_dir}/all_gpu_trace_metrics.list"
 ui_gpu1_cmds_path="${data_dir}/ui_gpu1.cmds"
 ui_gpu2_cmds_path="${data_dir}/ui_gpu2.cmds"
 ui_kgsl_cmds_path="${data_dir}/ui_kgsl.cmds"
+
+get_active_app_pkg() {
+  adb shell dumpsys activity activities | grep -E "mResumedActivity|ResumedActivity" |
+      head -n 1 | awk -F '[{/]' '{print $2}' | awk '{print $NF}' | tr -d '\r\n'
+}
+
+check_apk_debuggable() {
+  local pkg="$1"
+  adb shell dumpsys package "${pkg}" | grep "flags=" | grep -q "DEBUGGABLE"
+}
 
 duration_to_ms() {
   local duration="$1"
@@ -517,6 +531,16 @@ for (( i = 0; i < num_args; i++ )); do
   elif [[ "${args[${i}]}" = "--info" ]]; then
     adb shell getprop ro.build.description
     adb shell dumpsys SurfaceFlinger | grep GLES\:
+    active_pkg=$(get_active_app_pkg)
+    if [[ -n "${active_pkg}" ]]; then
+      if check_apk_debuggable "${active_pkg}"; then
+        echo "Active App: ${active_pkg} (DEBUGGABLE)"
+      else
+        echo "Active App: ${active_pkg} (NOT debuggable)"
+      fi
+    else
+      echo "Active App: None"
+    fi
     skip_tracing=true
   elif [[ "${args[${i}]}" = "--enable-gpu" ]]; then
     enable_gpu=true
@@ -617,6 +641,16 @@ for (( i = 0; i < num_args; i++ )); do
   elif [[ "${args[${i}]}" = "--perf-dump" ]]; then
     perf_dump=true
     include_gpu2=true
+  elif [[ "${args[${i}]}" = "--sampling-freq" ]]; then
+    i=$((i+1))
+    sampling_freq="${args[${i}]}"
+  elif [[ "${args[${i}]}" = "--sampling" ]]; then
+    sampling_target=$(get_active_app_pkg)
+    if [[ -z "${sampling_target}" ]]; then
+      echo "warning: --sampling was specified but no active app package was found. Skipping CPU sampling." >&2
+    fi
+  elif [[ "${args[${i}]}" == --sampling=* ]]; then
+    sampling_target="${args[${i}]#*=}"
   elif [[ "${args[${i}]}" = -* ]]; then
     echo "warning: ignoring unknown option ${args[${i}]}"
   else
@@ -1136,6 +1170,29 @@ EOL
   }
 }
 EOL
+
+  if [[ -n "${sampling_target}" ]]; then
+    cat >>"${config_filepath}" <<EOL
+data_sources {
+  config {
+    name: "linux.perf"
+    perf_event_config {
+      timebase {
+        counter: SW_CPU_CLOCK
+        frequency: ${sampling_freq}
+        timestamp_clock: PERF_CLOCK_MONOTONIC
+      }
+      callstack_sampling {
+        scope {
+          target_cmdline: "${sampling_target}"
+        }
+        kernel_frames: true
+      }
+    }
+  }
+}
+EOL
+  fi
 
   if [[ ( "${perfetto_version_major}" -ge 40 ) ]]; then
     cat >>"${config_filepath}" <<EOL
