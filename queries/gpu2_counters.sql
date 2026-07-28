@@ -78,13 +78,16 @@ WITH
           EXTRACT_ARG(arg_set_id, 'numRenderTargets') AS render_targets,
           EXTRACT_ARG(arg_set_id, 'renderMode') AS renderMode,
           (
-              SELECT SUM(CAST(COALESCE(int_value, string_value) AS INT))
+              SELECT SUM(MAX(0, CAST(COALESCE(int_value, string_value) AS INT)))
               FROM args
               WHERE arg_set_id = gpu_slice.arg_set_id
                 AND key GLOB 'Render Target * BPP'
           ) AS render_target_bpp,
-          CAST(COALESCE(NULLIF(NULLIF(EXTRACT_ARG(arg_set_id, 'render_pass'), '0'), 0),
-                        EXTRACT_ARG(arg_set_id, 'surfaceID')) AS TEXT) AS surface_key
+          CAST(
+              COALESCE(SUBSTR(EXTRACT_ARG(arg_set_id, 'context_id'), -8) || '-', '') ||
+              COALESCE(SUBSTR(NULLIF(NULLIF(EXTRACT_ARG(arg_set_id, 'render_pass'), '0'), 0), -9),
+                      SUBSTR(EXTRACT_ARG(arg_set_id, 'surfaceID'), -8))
+          AS TEXT) AS surface_key
       FROM gpu_slice
       WHERE name = 'Surface'
         AND upid IN (SELECT upid FROM target_procs)
