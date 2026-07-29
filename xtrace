@@ -368,6 +368,28 @@ check_apk_debuggable() {
   adb shell dumpsys package "${pkg}" | grep "flags=" | grep -q "DEBUGGABLE"
 }
 
+get_debuggable_app_pkgs() {
+  adb shell dumpsys package | awk '
+    /^[[:space:]]*Package \[/ {
+      split($0, parts, "[");
+      split(parts[2], subparts, "]");
+      pkg = subparts[1];
+    }
+    /flags=/ {
+      if ($0 ~ /DEBUGGABLE/) {
+        if (pkg != "") {
+          pkgs[pkg] = 1;
+        }
+      }
+      pkg = "";
+    }
+    END {
+      for (p in pkgs) {
+        print p;
+      }
+    }' | sort | paste -sd, - | sed 's/,/, /g'
+}
+
 duration_to_ms() {
   local duration="$1"
   local ms=$(($(echo "${duration}" | sed 's/h/*3600000+/g; s/m/*60000+/g; s/s/*1000+/g' | sed 's/+$/ /g')))
@@ -529,8 +551,14 @@ for (( i = 0; i < num_args; i++ )); do
     i=$((i+1))
     output_args_file="${args[${i}]}"
   elif [[ "${args[${i}]}" = "--info" ]]; then
-    adb shell getprop ro.build.description
+    echo "Build: $(adb shell getprop ro.build.description)"
     adb shell dumpsys SurfaceFlinger | grep GLES\:
+    debuggable_apps=$(get_debuggable_app_pkgs)
+    if [[ -n "${debuggable_apps}" ]]; then
+      echo "Debuggable Apps: ${debuggable_apps}"
+    else
+      echo "Debuggable Apps: None"
+    fi
     active_pkg=$(get_active_app_pkg)
     if [[ -n "${active_pkg}" ]]; then
       if check_apk_debuggable "${active_pkg}"; then
