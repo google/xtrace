@@ -131,6 +131,7 @@ show_help_and_exit() {
   echo "  [--sampling[=<proc>]]    Sample CPU callstacks for process <proc> (default is active app)"
   echo "  [--sampling-freq <freq>] CPU callstack sampling frequency in Hz (default: 100)"
   echo "  [--local]                Trace local OS instead of adb device (requires perfetto instrumentation)."
+  echo "  [--dual]                 Trace two adb devices simultaneously."
   echo "  [-t <duration_ms>]       Duration to trace (default is until Ctrl-C). Also supports h/m/s suffix:"
   echo "                           Examples: \"1m5s\" (1 minute + 5 seconds) or \"300\" (300 ms)"
   echo "  [-o <output_file_or_dir>]  Write trace to a file or directory"
@@ -345,6 +346,7 @@ fill_policy=RING_BUFFER
 verbose_logs=false
 verbose_err="/dev/null"
 is_quiet=false
+is_subshell=false
 kill_sleeper=false
 wake_seconds=''
 perf_dump=false
@@ -408,6 +410,12 @@ verbose() {
 
 notquiet() {
   if [[ "${is_quiet}" == false ]]; then
+    echo "$1"
+  fi
+}
+
+echo_notsubshell() {
+  if [[ "${is_subshell}" == false ]]; then
     echo "$1"
   fi
 }
@@ -476,6 +484,8 @@ num_args="${#args[@]}"
 for (( i = 0; i < num_args; i++ )); do
   if [[ "${args[${i}]}" = "--help" ]]; then
     show_help_and_exit
+  elif [[ "${args[${i}]}" = "--dual" ]]; then
+    is_dual=true
   elif [[ "${args[${i}]}" = "--local" ]]; then
     is_local=true
   elif [[ "${args[${i}]}" = "-t" ]]; then
@@ -673,12 +683,11 @@ for (( i = 0; i < num_args; i++ )); do
     i=$((i+1))
     sampling_freq="${args[${i}]}"
   elif [[ "${args[${i}]}" = "--sampling" ]]; then
-    sampling_target=$(get_active_app_pkg)
-    if [[ -z "${sampling_target}" ]]; then
-      echo "warning: --sampling was specified but no active app package was found. Skipping CPU sampling." >&2
-    fi
+    enable_sampling=true
   elif [[ "${args[${i}]}" == --sampling=* ]]; then
     sampling_target="${args[${i}]#*=}"
+  elif [[ "${args[${i}]}" = "--subshell-quiet" ]]; then
+    is_subshell=true
   elif [[ "${args[${i}]}" = -* ]]; then
     echo "warning: ignoring unknown option ${args[${i}]}"
   else
@@ -694,6 +703,212 @@ for (( i = 0; i < num_args; i++ )); do
     fi
   fi
 done
+
+
+set_title() {
+  title_args=$(echo "${title_args[@]}" | tr ' ' '-')
+  if [[ ! -z "${output_args_file}" ]]; then
+    echo "${title_args}" > "${output_args_file}"
+  fi
+
+  local ext=".perfetto"
+  if [[ "${is_dual}" == true ]]; then
+    ext=".perfetto.tar"
+  fi
+
+  if [[ -d "${output_file}" ]]; then
+    output_file=$($cygpathw "${output_file}/trace-${title_args}-${now}${ext}")
+  elif [[ -z "${output_file}" ]]; then
+    output_file="./trace-${title_args}-${now}${ext}"
+  fi
+
+  if [[ -f "${output_file}" ]]; then
+    rm "${output_file}"
+  fi
+  if touch "${output_file}"; then
+    rm "${output_file}"
+  else
+    echo "error: output file is not writable: ${output_file}" >&2
+    exit 1
+  fi
+}
+
+autoload () {
+  local did_open=false
+  if [[ "${auto_open}" == true ]]; then
+    if [[ -z "${ui_sql_path}" ]]; then
+      if [[ "${include_gpu}" == true ]] && [[ "${include_gpu2}" == false ]]; then
+        ui_sql_path="$($cygpathw ${ui_kgsl_cmds_path})"
+      fi
+      if [[ "${include_gpu2}" == true ]] && [[ "${gpu2_low_overhead}" == true ]]; then
+        ui_sql_path="$($cygpathw ${ui_gpu1_cmds_path})"
+      fi
+      if [[ "${include_gpu2}" == true ]] && [[ "${gpu2_low_overhead}" == false ]]; then
+        ui_sql_path="$($cygpathw ${ui_gpu2_cmds_path})"
+      fi
+    fi
+
+    openscript="${xtrace_dir}/third_party/perfetto/open-trace.py";
+    if [[ -f "${openscript}" ]]; then
+      if [[ "${is_big}" == true ]]; then
+        echo "Starting trace_processor_shell and perfetto UI..."
+        echo ""
+        echo "This requires 'Relax Content Security Policy' to be enabled in perfetto UI flags."
+        echo "Follow the dialog if you don't have it enabled yet."
+        echo ""
+        # Get an unused port:
+        port=$(${python} -c '
+import socket
+sock = socket.socket()
+sock.bind(("127.0.0.1", 0))
+sockname = sock.getsockname()
+print(sockname[1])
+sock.close()')
+        version=$("${host_tools_dir}/trace_processor_shell" -v | grep Perfetto | awk '{print $2}')
+        # Adding version makes the UI match the perfetto binaries in third_party/perfetto.
+        address="https://ui.perfetto.dev/${version}/#!/?rpc_port=${port}"
+        echo "Wait for trace to load (look for \"Trace loaded\"), then open this link:"
+        echo ""
+        echo "    ----->   ${address}"
+        echo ""
+        # Launch trace_processor_shell on the trace file:
+        ${bg_bash} "${host_tools_dir}/trace_processor_shell -D --http-port ${port} \"${output_file}\"" &
+        did_open=true
+      else
+        if [[ -n "${ui_sql_path}" ]] && [[ ! -f "${ui_sql_path}" ]]; then
+          echo "error: file not found: ${ui_sql_path}" >&2
+        fi
+        ${python} "$($cygpathw "${openscript}")" "${output_file}" "${ui_sql_path}" 2>/dev/null && did_open=true
+      fi
+    fi
+
+    [[ "${did_open}" == false ]] && [[ -z "${sql_path}" ]] &&
+      echo "Open it at https://ui.perfetto.dev/"
+  fi
+}
+
+do_dual_trace() {
+  local devices=($(adb devices 2>/dev/null | tr -d '\r' | awk '/[[:space:]]+device[[:space:]]*$/ { print $1 }'))
+  if [[ "${#devices[@]}" -lt 2 ]]; then
+    echo "error: --dual requires at least 2 adb devices (found ${#devices[@]})" >&2
+    exit 1
+  fi
+
+  local model1=$(adb -s "${devices[0]}" shell getprop ro.product.model 2>/dev/null | tr -d '\r')
+  local model2=$(adb -s "${devices[1]}" shell getprop ro.product.model 2>/dev/null | tr -d '\r')
+  [[ -z "${model1}" ]] && model1="Device1"
+  [[ -z "${model2}" ]] && model2="Device2"
+
+  local time_string="... press Ctrl-C to stop"
+  if [[ "${time_ms}" != "0" ]]; then
+    time_string=" for ${time_ms} ms..."
+  fi
+  echo "Tracing ${model1} and ${model2} ${time_string}"
+
+  local sub_args=("--no-frame-stats")
+  local has_no_open=false
+  local num_args="$#"
+  local all_args=("$@")
+  for (( idx = 0; idx < num_args; idx++ )); do
+    local arg="${all_args[${idx}]}"
+    if [[ "${arg}" = "--dual" ]] || [[ "${arg}" = "--subshell-quiet" ]]; then
+      continue
+    fi
+    if [[ "${arg}" = "--no-open" ]]; then
+      has_no_open=true
+    fi
+    if [[ "${arg}" = "-o" ]] && (( idx + 1 < num_args )); then
+      idx=$((idx+1))
+      continue
+    fi
+    sub_args+=("${arg}")
+  done
+  if [[ "${has_no_open}" = false ]]; then
+    sub_args+=("--no-open")
+  fi
+  sub_args+=("--subshell-quiet")
+  sub_args+=("--atrace-apps" "com.google.android.glasses.core")
+
+  rm -f /tmp/xtrace_merge_trace1.log /tmp/xtrace_merge_trace2.log \
+        /tmp/xtrace_merge_trace1.perfetto /tmp/xtrace_merge_trace2.perfetto
+
+  ( ANDROID_SERIAL="${devices[0]}" "${xtrace_exec}" "${sub_args[@]}" \
+    -o /tmp/xtrace_merge_trace1.perfetto > /tmp/xtrace_merge_trace1.log 2>&1 ) &
+  local pid1=$!
+  ( ANDROID_SERIAL="${devices[1]}" "${xtrace_exec}" "${sub_args[@]}" \
+    -o /tmp/xtrace_merge_trace2.perfetto > /tmp/xtrace_merge_trace2.log 2>&1 ) &
+  local pid2=$!
+
+  trap 'echo ; echo "Please wait: copying traces from devices..." ; kill -USR1 "${pid1}" "${pid2}" 2>/dev/null' SIGINT
+  while kill -0 "${pid1}" 2>/dev/null || kill -0 "${pid2}" 2>/dev/null; do
+    wait "${pid1}" "${pid2}" 2>/dev/null
+  done
+  trap - SIGINT
+
+  if [[ -f /tmp/xtrace_merge_trace1.log ]]; then
+    cat /tmp/xtrace_merge_trace1.log
+  fi
+  if [[ -f /tmp/xtrace_merge_trace2.log ]]; then
+    echo ""
+    cat /tmp/xtrace_merge_trace2.log
+  fi
+
+  if [[ ! -f /tmp/xtrace_merge_trace1.perfetto ]] || [[ ! -f /tmp/xtrace_merge_trace2.perfetto ]]; then
+    echo "error: dual trace recording failed (missing trace output from subshell)" >&2
+    exit 1
+  fi
+
+  title_args+=("${model1// /_}" "${model2// /_}")
+  set_title
+
+  cat << EOF > /tmp/xtrace_merge_manifest.json
+{
+  "perfetto_manifest": {
+    "version": 1,
+    "trace_time": {
+      "clock": "REALTIME"
+    },
+    "files": [
+      {
+        "path": "xtrace_merge_trace1.perfetto",
+        "machine": {
+          "name": "${model1}"
+        }
+      },
+      {
+        "path": "xtrace_merge_trace2.perfetto",
+        "machine": {
+          "name": "${model2}"
+        }
+      }
+    ]
+  }
+}
+EOF
+
+  if "${host_tools_dir}/trace_processor_shell" util merge -o "${output_file}" \
+      --manifest /tmp/xtrace_merge_manifest.json \
+      /tmp/xtrace_merge_trace1.perfetto /tmp/xtrace_merge_trace2.perfetto > /dev/null; then
+    du -hs "${output_file}"
+    rm -f /tmp/xtrace_merge_trace1.perfetto /tmp/xtrace_merge_trace2.perfetto /tmp/xtrace_merge_manifest.json
+
+    if [[ "${has_no_open}" = false ]]; then
+      autoload
+    fi
+  fi
+}
+
+if [[ "${is_dual}" == true ]]; then
+  do_dual_trace "${args[@]}"
+  exit $?
+fi
+
+if [[ "${enable_sampling}" == true ]] && [[ -z "${sampling_target}" ]]; then
+  sampling_target=$(get_active_app_pkg)
+  if [[ -z "${sampling_target}" ]]; then
+    echo "warning: --sampling was specified but no active app package was found. Skipping CPU sampling." >&2
+  fi
+fi
 
 # If counters are requested, switch to renderstage mode if also using --gpu2.
 if [[ "${include_counters}" == true ]]; then
@@ -1499,60 +1714,6 @@ if [[ "${is_local}" == true ]]; then
   fi
 fi
 
-autoload () {
-  did_open=false
-  if [[ "${auto_open}" == true ]]; then
-    if [[ -z "${ui_sql_path}" ]]; then
-      if [[ "${include_gpu}" == true ]] && [[ "${include_gpu2}" == false ]]; then
-        ui_sql_path="$($cygpathw ${ui_kgsl_cmds_path})"
-      fi
-      if [[ "${include_gpu2}" == true ]] && [[ "${gpu2_low_overhead}" == true ]]; then
-        ui_sql_path="$($cygpathw ${ui_gpu1_cmds_path})"
-      fi
-      if [[ "${include_gpu2}" == true ]] && [[ "${gpu2_low_overhead}" == false ]]; then
-        ui_sql_path="$($cygpathw ${ui_gpu2_cmds_path})"
-      fi
-    fi
-
-    openscript="${xtrace_dir}/third_party/perfetto/open-trace.py";
-    if [[ -f "${openscript}" ]]; then
-      if [[ "${is_big}" == true ]]; then
-        echo "Starting trace_processor_shell and perfetto UI..."
-        echo ""
-        echo "This requires 'Relax Content Security Policy' to be enabled in perfetto UI flags."
-        echo "Follow the dialog if you don't have it enabled yet."
-        echo ""
-        # Get an unused port:
-        port=$(${python} -c '
-import socket
-sock = socket.socket()
-sock.bind(("127.0.0.1", 0))
-sockname = sock.getsockname()
-print(sockname[1])
-sock.close()')
-        version=$("${host_tools_dir}/trace_processor_shell" -v | grep Perfetto | awk '{print $2}')
-        # Adding version makes the UI match the perfetto binaries in third_party/perfetto.
-        address="https://ui.perfetto.dev/${version}/#!/?rpc_port=${port}"
-        echo "Wait for trace to load (look for \"Trace loaded\"), then open this link:"
-        echo ""
-        echo "    ----->   ${address}"
-        echo ""
-        # Launch trace_processor_shell on the trace file:
-        ${bg_bash} "${host_tools_dir}/trace_processor_shell -D --http-port ${port} \"${output_file}\"" &
-        did_open=true
-      else
-        if [[ -n "${ui_sql_path}" ]] && [[ ! -f "${ui_sql_path}" ]]; then
-          echo "error: file not found: ${ui_sql_path}" >&2
-        fi
-        ${python} "$($cygpathw "${openscript}")" "${output_file}" "${ui_sql_path}" 2>/dev/null && did_open=true
-      fi
-    fi
-
-    [[ "${did_open}" == false ]] && [[ -z "${sql_path}" ]] &&
-      echo "Open it at https://ui.perfetto.dev/"
-  fi
-}
-
 run_trace_processor() {
   if [[ "${verbose_sql_logs}" == true ]]; then
     "${host_tools_dir}/trace_processor_shell" -q "$($cygpathw "$1")" "${output_file}"
@@ -1776,28 +1937,6 @@ if [[ "${from_file}" == true ]]; then
   exit 0
 fi
 
-set_title() {
-  title_args=$(echo "${title_args[@]}" | tr ' ' '-')
-  if [[ ! -z "${output_args_file}" ]]; then
-    echo "${title_args}" > "${output_args_file}"
-  fi
-
-  if [[ -d "${output_file}" ]]; then
-    output_file=$($cygpathw "${output_file}/trace-${title_args}-${now}.perfetto")
-  elif [[ -z "${output_file}" ]]; then
-    output_file="./trace-${title_args}-${now}.perfetto"
-  fi
-
-  if [[ -f "${output_file}" ]]; then
-    rm "${output_file}"
-  fi
-  if touch "${output_file}"; then
-    rm "${output_file}"
-  else
-    echo "error: output file is not writable: ${output_file}" >&2
-    exit 1
-  fi
-}
 
 if [[ "${is_local}" == false ]] && [[ "${lock_frequencies}" == true ]]; then
   orig_dyn_policy=$(adb shell getprop device_config.com_android_xr.com.android.xr.flags.enable_dynamic_policy)
@@ -1942,14 +2081,14 @@ end_time_ns=$((cur_time_ns + wait_ns))
 stop_waiting () { end_time_ns="${cur_time_ns}" ; }
 trap "echo ; stop_waiting" SIGINT
 trap "stop_waiting" SIGUSR1
-echo "Tracing ${target_name}${time_string}"
+echo_notsubshell "Tracing ${target_name}${time_string}"
 # Note this sleep is intentionally short because parent script may
 # send us a SIGUSR1 that we only handle in between sleeps.
 while [[ ( $(get_time_ns) < "${end_time_ns}" ) ]]; do sleep 0.1; done
 trap - SIGINT SIGUSR1
 
 # Kill all perfetto processes and wait for them to finish.
-echo "Please wait: copying trace from ${target_name}..."
+echo_notsubshell "Please wait: copying trace from ${target_name}..."
 
 # Wait for device in case it was unplugged during the trace.
 adb wait-for-device
@@ -1975,7 +2114,7 @@ fi
     append_trace_attribute "gpu_driver_info" "${gpu_driver_info}" "${output_file}"
 [[ -n "${adreno_driver_version}" ]] &&
     append_trace_attribute "adreno_driver_version" "${adreno_driver_version}" "${output_file}"
-du -hs "${output_file}"
+echo_notsubshell $(du -hs "${output_file}")
 autoload
 
 cap_screenshot() {
