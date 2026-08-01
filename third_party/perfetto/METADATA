@@ -7,10 +7,10 @@ description:
 third_party {
   identifier {
     type: "Archive"
-    value: "https://github.com/google/perfetto/releases/tag/v53.0"
+    value: "https://github.com/google/perfetto/tree/v58.2"
     primary_source: true
-    version: "v53.0"
+    version: "v58.2"
   }
-  version: "v53.0"
+  version: "v58.2"
   license_type: PERMISSIVE
 }
