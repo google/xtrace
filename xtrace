@@ -52,6 +52,30 @@ is_adb_root() {
   [[ "${_IS_ROOTED_STATUS}" == true ]]
 }
 
+_ALL_ADB_DEVICES=()
+_ALL_ADB_DEVICE_STATUSES=()
+_READY_ADB_DEVICES=()
+_ADB_DEVICES_CACHED=false
+
+get_adb_devices() {
+  if [[ "${_ADB_DEVICES_CACHED}" == false ]]; then
+    _ALL_ADB_DEVICES=()
+    _ALL_ADB_DEVICE_STATUSES=()
+    _READY_ADB_DEVICES=()
+    local id status
+    while read -r id status _; do
+      if [[ -n "${id}" ]]; then
+        _ALL_ADB_DEVICES+=("${id}")
+        _ALL_ADB_DEVICE_STATUSES+=("${status}")
+        if [[ "${status}" == "device" ]]; then
+          _READY_ADB_DEVICES+=("${id}")
+        fi
+      fi
+    done < <(adb devices 2>/dev/null | tr -d '\r' | awk 'NR>1 && NF>=2 { print $1, $2 }')
+    _ADB_DEVICES_CACHED=true
+  fi
+}
+
 # echo if adb device is rooted.
 ecRT() {
   if is_adb_root; then
@@ -72,6 +96,7 @@ show_help_and_exit() {
   echo "Configure device tracing options:"
   echo "  (no tracing is done with these options)"
   echo "  [--info]                 Print device build and GPU info"
+  echo "  [--adb <index|id|all>]   Target adb device by 1-based index, device ID, or 'all' for all attached devices."
   ecNR "  [--enable-gpu]           Enable GPU tracing on the device."
   ecNR "                           Note: Restart the app and then trace with --gpu1 or --gpu2."
   ecNR "  [--disable-gpu]          Disable GPU tracing on the device"
@@ -131,7 +156,7 @@ show_help_and_exit() {
   echo "  [--sampling[=<proc>]]    Sample CPU callstacks for process <proc> (default is active app)"
   echo "  [--sampling-freq <freq>] CPU callstack sampling frequency in Hz (default: 100)"
   echo "  [--local]                Trace local OS instead of adb device (requires perfetto instrumentation)."
-  echo "  [--dual]                 Trace two adb devices simultaneously."
+  echo "  [--merge]                Trace two devices simultaneously and merge into a single trace timeline."
   echo "  [-t <duration_ms>]       Duration to trace (default is until Ctrl-C). Also supports h/m/s suffix:"
   echo "                           Examples: \"1m5s\" (1 minute + 5 seconds) or \"300\" (300 ms)"
   echo "  [-o <output_file_or_dir>]  Write trace to a file or directory"
@@ -333,7 +358,11 @@ from_file=false
 is_big=false
 output_file=''
 trace_input_files=()
+adb_targets=()
+selected_devices=()
 is_compare=false
+is_info=false
+is_merge=false
 config_filename="perfetto-${RANDOM}.config"
 config_filepath="/tmp/${config_filename}"
 use_existing_config=false
@@ -484,8 +513,11 @@ num_args="${#args[@]}"
 for (( i = 0; i < num_args; i++ )); do
   if [[ "${args[${i}]}" = "--help" ]]; then
     show_help_and_exit
-  elif [[ "${args[${i}]}" = "--dual" ]]; then
-    is_dual=true
+  elif [[ "${args[${i}]}" = "--merge" ]]; then
+    is_merge=true
+  elif [[ "${args[${i}]}" = "--adb" ]] && (( i + 1 < num_args )); then
+    i=$((i+1))
+    adb_targets+=("${args[${i}]}")
   elif [[ "${args[${i}]}" = "--local" ]]; then
     is_local=true
   elif [[ "${args[${i}]}" = "-t" ]]; then
@@ -561,24 +593,7 @@ for (( i = 0; i < num_args; i++ )); do
     i=$((i+1))
     output_args_file="${args[${i}]}"
   elif [[ "${args[${i}]}" = "--info" ]]; then
-    echo "Build: $(adb shell getprop ro.build.description)"
-    adb shell dumpsys SurfaceFlinger | grep GLES\:
-    debuggable_apps=$(get_debuggable_app_pkgs)
-    if [[ -n "${debuggable_apps}" ]]; then
-      echo "Debuggable Apps: ${debuggable_apps}"
-    else
-      echo "Debuggable Apps: None"
-    fi
-    active_pkg=$(get_active_app_pkg)
-    if [[ -n "${active_pkg}" ]]; then
-      if check_apk_debuggable "${active_pkg}"; then
-        echo "Active App: ${active_pkg} (DEBUGGABLE)"
-      else
-        echo "Active App: ${active_pkg} (NOT debuggable)"
-      fi
-    else
-      echo "Active App: None"
-    fi
+    is_info=true
     skip_tracing=true
   elif [[ "${args[${i}]}" = "--enable-gpu" ]]; then
     enable_gpu=true
@@ -712,7 +727,7 @@ set_title() {
   fi
 
   local ext=".perfetto"
-  if [[ "${is_dual}" == true ]]; then
+  if [[ "${is_merge}" == true ]]; then
     ext=".perfetto.tar"
   fi
 
@@ -787,10 +802,179 @@ sock.close()')
   fi
 }
 
-do_dual_trace() {
-  local devices=($(adb devices 2>/dev/null | tr -d '\r' | awk '/[[:space:]]+device[[:space:]]*$/ { print $1 }'))
+run_multi_device_trace() {
+  local print_headers="$1"
+  shift
+  local num_devs="$1"
+  shift
+  local target_devs=()
+  local d
+  for (( d = 0; d < num_devs; d++ )); do
+    target_devs+=("$1")
+    shift
+  done
+  local sub_args=("$@")
+
+  local i
+  for (( i = 1; i <= num_devs; i++ )); do
+    rm -f "/tmp/xtrace_merge_trace${i}.log" "/tmp/xtrace_merge_trace${i}.perfetto"
+  done
+
+  if [[ "${print_headers}" == true ]]; then
+    for (( i = 0; i < num_devs; i++ )); do
+      local dev="${target_devs[${i}]}"
+      echo "Command: ANDROID_SERIAL=${dev} ${xtrace_exec} ${sub_args[*]}"
+    done
+  fi
+
+  local pids=()
+  for (( i = 0; i < num_devs; i++ )); do
+    local dev="${target_devs[${i}]}"
+    local idx=$((i + 1))
+    ( ANDROID_SERIAL="${dev}" "${xtrace_exec}" "${sub_args[@]}" \
+      -o "/tmp/xtrace_merge_trace${idx}.perfetto" > "/tmp/xtrace_merge_trace${idx}.log" ) &
+    pids+=($!)
+  done
+
+  trap 'echo ; echo "Please wait: copying traces from devices..." ; kill -USR1 "${pids[@]}" 2>/dev/null' SIGINT
+  local any_running=true
+  while [[ "${any_running}" == true ]]; do
+    any_running=false
+    local pid
+    for pid in "${pids[@]}"; do
+      if kill -0 "${pid}" 2>/dev/null; then
+        any_running=true
+        break
+      fi
+    done
+    if [[ "${any_running}" == true ]]; then
+      wait "${pids[@]}" 2>/dev/null
+    fi
+  done
+  trap - SIGINT
+
+  for (( i = 0; i < num_devs; i++ )); do
+    local dev="${target_devs[${i}]}"
+    local idx=$((i + 1))
+    local log_file="/tmp/xtrace_merge_trace${idx}.log"
+    if [[ "${print_headers}" == true ]]; then
+      local dev_name=$(adb -s "${dev}" shell getprop ro.product.model 2>/dev/null | tr -d '\r')
+      [[ -z "${dev_name}" ]] && dev_name="${dev}"
+      echo "== ${dev_name} =============================================================="
+    fi
+    if [[ -f "${log_file}" ]]; then
+      cat "${log_file}"
+    fi
+  done
+}
+
+process_adb_targets() {
+  get_adb_devices
+  selected_devices=()
+  local t
+  for t in "${adb_targets[@]}"; do
+    if [[ "${t}" == "all" ]] || [[ "${t}" == "*" ]]; then
+      selected_devices+=("${_READY_ADB_DEVICES[@]}")
+    elif [[ "${t}" =~ ^[0-9]{1,2}$ ]]; then
+      # 1-based device index
+      if (( t >= 1 && t <= ${#_ALL_ADB_DEVICES[@]} )); then
+        selected_devices+=("${_ALL_ADB_DEVICES[$((t - 1))]}")
+      else
+        echo "error: invalid device index ${t} (found ${#_ALL_ADB_DEVICES[@]} device(s))" >&2
+        exit 1
+      fi
+    else
+      # device id
+      local found=false
+      local dev
+      for dev in "${_ALL_ADB_DEVICES[@]}"; do
+        if [[ "${dev}" == "${t}" ]]; then
+          selected_devices+=("${dev}")
+          found=true
+          break
+        fi
+      done
+      if [[ "${found}" == false ]]; then
+        echo "error: adb device '${t}' not found" >&2
+        exit 1
+      fi
+    fi
+  done
+
+  # Verify selected devices are all ready (status == "device")
+  for dev in "${selected_devices[@]}"; do
+    local idx
+    for (( idx = 0; idx < ${#_ALL_ADB_DEVICES[@]}; idx++ )); do
+      if [[ "${_ALL_ADB_DEVICES[idx]}" == "${dev}" ]]; then
+        local st="${_ALL_ADB_DEVICE_STATUSES[idx]}"
+        if [[ "${st}" != "device" ]]; then
+          echo "error: adb device '${dev}' is ${st}" >&2
+          exit 1
+        fi
+        break
+      fi
+    done
+  done
+
+  if [[ "${#selected_devices[@]}" -eq 0 ]]; then
+    echo "error: no adb device selected" >&2
+    exit 1
+  fi
+}
+
+execute_xtrace_on_selected_devices() {
+  if [[ "${#selected_devices[@]}" -eq 1 ]]; then
+    export ANDROID_SERIAL="${selected_devices[0]}"
+  elif [[ "${#selected_devices[@]}" -gt 1 ]]; then
+    # Multiple devices specified via --adb
+    local sub_args=()
+    local num_args="${#args[@]}"
+    local idx
+    for (( idx = 0; idx < num_args; idx++ )); do
+      local arg="${args[${idx}]}"
+      if [[ "${arg}" = "--adb" ]] && (( idx + 1 < num_args )); then
+        idx=$((idx+1))
+        continue
+      fi
+      sub_args+=("${arg}")
+    done
+
+    run_multi_device_trace true "${#selected_devices[@]}" "${selected_devices[@]}" "${sub_args[@]}"
+    exit 0
+  fi
+}
+
+show_info() {
+  echo "Build: $(adb shell getprop ro.build.description)"
+  adb shell dumpsys SurfaceFlinger | grep GLES\:
+  debuggable_apps=$(get_debuggable_app_pkgs)
+  if [[ -n "${debuggable_apps}" ]]; then
+    echo "Debuggable Apps: ${debuggable_apps}"
+  else
+    echo "Debuggable Apps: None"
+  fi
+  active_pkg=$(get_active_app_pkg)
+  if [[ -n "${active_pkg}" ]]; then
+    if check_apk_debuggable "${active_pkg}"; then
+      echo "Active App: ${active_pkg} (DEBUGGABLE)"
+    else
+      echo "Active App: ${active_pkg} (NOT debuggable)"
+    fi
+  else
+    echo "Active App: None"
+  fi
+}
+
+do_merge_trace() {
+  local devices=()
+  if [[ "${#selected_devices[@]}" -gt 0 ]]; then
+    devices=("${selected_devices[@]}")
+  else
+    get_adb_devices
+    devices=("${_READY_ADB_DEVICES[@]}")
+  fi
   if [[ "${#devices[@]}" -lt 2 ]]; then
-    echo "error: --dual requires at least 2 adb devices (found ${#devices[@]})" >&2
+    echo "error: --merge requires at least 2 adb devices (found ${#devices[@]})" >&2
     exit 1
   fi
 
@@ -811,7 +995,11 @@ do_dual_trace() {
   local all_args=("$@")
   for (( idx = 0; idx < num_args; idx++ )); do
     local arg="${all_args[${idx}]}"
-    if [[ "${arg}" = "--dual" ]] || [[ "${arg}" = "--subshell-quiet" ]]; then
+    if [[ "${arg}" = "--merge" ]] || [[ "${arg}" = "--subshell-quiet" ]]; then
+      continue
+    fi
+    if [[ "${arg}" = "--adb" ]] && (( idx + 1 < num_args )); then
+      idx=$((idx+1))
       continue
     fi
     if [[ "${arg}" = "--no-open" ]]; then
@@ -829,32 +1017,10 @@ do_dual_trace() {
   sub_args+=("--subshell-quiet")
   sub_args+=("--atrace-apps" "com.google.android.glasses.core")
 
-  rm -f /tmp/xtrace_merge_trace1.log /tmp/xtrace_merge_trace2.log \
-        /tmp/xtrace_merge_trace1.perfetto /tmp/xtrace_merge_trace2.perfetto
-
-  ( ANDROID_SERIAL="${devices[0]}" "${xtrace_exec}" "${sub_args[@]}" \
-    -o /tmp/xtrace_merge_trace1.perfetto > /tmp/xtrace_merge_trace1.log 2>&1 ) &
-  local pid1=$!
-  ( ANDROID_SERIAL="${devices[1]}" "${xtrace_exec}" "${sub_args[@]}" \
-    -o /tmp/xtrace_merge_trace2.perfetto > /tmp/xtrace_merge_trace2.log 2>&1 ) &
-  local pid2=$!
-
-  trap 'echo ; echo "Please wait: copying traces from devices..." ; kill -USR1 "${pid1}" "${pid2}" 2>/dev/null' SIGINT
-  while kill -0 "${pid1}" 2>/dev/null || kill -0 "${pid2}" 2>/dev/null; do
-    wait "${pid1}" "${pid2}" 2>/dev/null
-  done
-  trap - SIGINT
-
-  if [[ -f /tmp/xtrace_merge_trace1.log ]]; then
-    cat /tmp/xtrace_merge_trace1.log
-  fi
-  if [[ -f /tmp/xtrace_merge_trace2.log ]]; then
-    echo ""
-    cat /tmp/xtrace_merge_trace2.log
-  fi
+  run_multi_device_trace false "${#devices[@]}" "${devices[@]}" "${sub_args[@]}"
 
   if [[ ! -f /tmp/xtrace_merge_trace1.perfetto ]] || [[ ! -f /tmp/xtrace_merge_trace2.perfetto ]]; then
-    echo "error: dual trace recording failed (missing trace output from subshell)" >&2
+    echo "error: merge trace recording failed (missing trace output from subshell)" >&2
     exit 1
   fi
 
@@ -897,18 +1063,6 @@ EOF
     fi
   fi
 }
-
-if [[ "${is_dual}" == true ]]; then
-  do_dual_trace "${args[@]}"
-  exit $?
-fi
-
-if [[ "${enable_sampling}" == true ]] && [[ -z "${sampling_target}" ]]; then
-  sampling_target=$(get_active_app_pkg)
-  if [[ -z "${sampling_target}" ]]; then
-    echo "warning: --sampling was specified but no active app package was found. Skipping CPU sampling." >&2
-  fi
-fi
 
 # If counters are requested, switch to renderstage mode if also using --gpu2.
 if [[ "${include_counters}" == true ]]; then
@@ -1006,8 +1160,60 @@ kill_sleeper_daemon() {
 
 target_name="local"
 if [[ "${is_local}" == false ]] && [[ "${from_file}" == false ]]; then
-  adb wait-for-device
+  if [[ "${#adb_targets[@]}" -gt 0 ]]; then
+    process_adb_targets
+  fi
+
+  if [[ "${is_merge}" == true ]]; then
+    do_merge_trace "${args[@]}"
+    exit $?
+  fi
+
+  if [[ "${#selected_devices[@]}" -gt 0 ]]; then
+    execute_xtrace_on_selected_devices
+  fi
+
+  wait_output=$(adb wait-for-device 2>&1)
+  wait_status=$?
+
+  if [[ ${wait_status} -ne 0 ]]; then
+    if [[ -n "${wait_output}" ]]; then
+      echo "${wait_output}" >&2
+    else
+      echo "error: adb wait-for-device failed" >&2
+    fi
+    get_adb_devices
+    if [[ "${#_ALL_ADB_DEVICES[@]}" -gt 1 ]]; then
+      dev_idx=1
+      for (( i = 0; i < ${#_ALL_ADB_DEVICES[@]}; i++ )); do
+        dev_id="${_ALL_ADB_DEVICES[i]}"
+        st="${_ALL_ADB_DEVICE_STATUSES[i]}"
+        if [[ "${st}" == "device" ]]; then
+          dev_model=$(adb -s "${dev_id}" shell getprop ro.product.model 2>/dev/null | tr -d '\r')
+          st="${dev_model}"
+        fi
+        echo "Device ${dev_idx}: ${st} (target with --adb ${dev_idx} or --adb ${dev_id})"
+        dev_idx=$((dev_idx + 1))
+      done
+      if [[ "${#_ALL_ADB_DEVICES[@]}" -gt 1 ]]; then
+        echo "Tip: Use '--adb all' to target all ready devices, or pass multiple '--adb X' flags to target a specific set of devices."
+      fi
+    fi
+    exit 1
+  fi
+
   is_adb_root && adb wait-for-device
+
+  if [[ "${is_info}" == true ]]; then
+    show_info
+  fi
+
+  if [[ "${enable_sampling}" == true ]] && [[ -z "${sampling_target}" ]]; then
+    sampling_target=$(get_active_app_pkg)
+    if [[ -z "${sampling_target}" ]]; then
+      echo "warning: --sampling was specified but no active app package was found. Skipping CPU sampling." >&2
+    fi
+  fi
 
   do_stop_start=false
 
