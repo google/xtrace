@@ -14,7 +14,7 @@ Help pinpoint performance problems with deep knowledge of Android XR, Adreno GPU
 ### --frame-stats tips:
 *   Drops and DropsPM (drops per minute) are the critical metrics - a few drops may be okay but higher drop rates can cause real discomfort in XR.
 *   If the GpuMSPF is too high, the simplest fix for XR applications is to reduce the Render Scale or MSAA (MSAA 2 is often enough and 4 can be costly).
-*   surfaceflinger Drops (compositor frame drops in Android XR) should be zero. Otherwise there may be another process with very expensive shaders or overdraw (to confirm that, look at the --gpu2 trace --surface-stats for a "RenderMaxMS" of more than 1 or 2 ms).
+*   surfaceflinger Drops (compositor frame drops in Android XR) should be zero. Otherwise there may be another process with very expensive shaders or overdraw (to confirm that, look at the --gpu2 trace --surface-stats for a "RenderMaxMS" of more than around 2 ms).
 *   surfaceflinger FPS should be close to the display FPS (ie: 60, 72, or 90), and is typically what each rendering process should match (except for spacewarp apps which may show as half framerate).
 *   The XR app's GPU budget is NOT the display period. It is display period MINUS surfaceflinger GpuMSPF (compositor GPU usage). The GPU cost of compositing increases with higher app resolution and content detail (more detail is less efficient with UBWC).
 *   TopThread1 and TopThread2 are often the app's "main" and "render" threads. Their corresponding MSPF1 and MSPF2 can indicate whether the app is CPU bound (ie: if MSPF is close to the frame period).
@@ -40,11 +40,13 @@ Help pinpoint performance problems with deep knowledge of Android XR, Adreno GPU
 ### --surface-stats tips:
 *   A surface in these stats is a full renderpass that resolves out to DDR.
 *   For the first trace, use the surface stats for overall surface render times and surface attributes. Mobile XR apps perform best with one GPU surface, but sometimes more are necessary. If there are more than one with the same resolution, that can indicate a misconfigured render pass that prevents multiple sub-passes from merging into a single surface event.
-*   For the second --gpu2 --counters trace remember that the GpuMSPF values may be inflated due to tracing overhead, and the Bin and Render times may also be off, but are useful ballpark figures.
-*   Only the second trace will have numbers for RenderMaxMS, which is important as noted above to be less than a couple ms to avoid compositor tearing.
-*   Watch for interesting abnormalities in RTs (render target count, ie: 2 for color + depth), RTBPP (total bits per pixel, ie: 64 for for 32-bit color and depth).
+*   For the second --gpu2 --counters trace remember that the GpuMSPF values may be ~50+% inflated due to tracing overhead, and the Bin and Render times may also be off, but are useful ballpark figures.
+*   Watch for interesting abnormalities in RTs (render target count, ex: 2 for color + depth), RTBPP (total bits per pixel, ex: 64 for 32-bit color and depth).
+*   Only the second trace will have numbers for RenderMaxMS, CSt, DSt, CLd, and DLd. RenderMaxMS is important as noted above to be less than a couple ms to avoid compositor tearing.
+*   CLd and DLd are the number of GMEM Color Loads and Depth/Stencil Loads (aka unresolves: transfering attachment data from DDR to GMEM), and are often a red flag. If either of these are > 0, check if the app is failing to clear or discard attachments each frame (eg, missing glClear or LOAD_OP_DONT_CARE).
+*   CSt and DSt are the number of GMEM Color Stores and Depth/Stencil Stores (aka resolves: transfering data from GMEM to DDR). CSt is typically 1 since to output our surface color. DSt should usually be 0 because depth and stencil buffers are typically only needed in GMEM during the render pass. Some features may require resolving depth (eg, spacewarp, shadow mapping or depth post-processing). To avoid wasting DDR bandwidth for unnecessary depth stores, invalidate or discard the depth/stencil attachment at the end of the pass.
 *   Check the RenderMode for direct vs binning. A direct-mode surface is often a problem on XR because they may not be preemptible or they may be faster with tiled rendering. To force binning mode, dev can try adding a second draw call with a single degenerate triangle.
-*   GpuMaxMS is the longest GPU usage duration for a single Surface event. Useful to explain some frame drops if the sum of these is higher than the average GpuMSPF and looks close to the frame period after accounting for additional compositor overhead.
+*   GpuMaxMS is the longest GPU usage duration for a single Surface event. Useful to explain some frame drops if the sum of these GpuMaxMS across all per-frame surfaces (ie: the worst case GPU usage for a single frame) is higher than the average GpuMSPF and looks more than the frame period after accounting for additional compositor overhead.
 
 ### --counter-stats tips:
 *   The $$$ counters are synthesized from other data.
