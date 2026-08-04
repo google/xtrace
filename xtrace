@@ -805,6 +805,8 @@ sock.close()')
 run_multi_device_trace() {
   local print_headers="$1"
   shift
+  local capture_logs="$1"
+  shift
   local num_devs="$1"
   shift
   local target_devs=()
@@ -831,12 +833,27 @@ run_multi_device_trace() {
   for (( i = 0; i < num_devs; i++ )); do
     local dev="${target_devs[${i}]}"
     local idx=$((i + 1))
-    ( ANDROID_SERIAL="${dev}" "${xtrace_exec}" "${sub_args[@]}" \
-      -o "/tmp/xtrace_merge_trace${idx}.perfetto" > "/tmp/xtrace_merge_trace${idx}.log" ) &
+    local log_dest="/dev/stdout"
+    if [[ "${capture_logs}" == true ]]; then
+      log_dest="/tmp/xtrace_merge_trace${idx}.log"
+    fi
+    ANDROID_SERIAL="${dev}" "${xtrace_exec}" "${sub_args[@]}" \
+        -o "/tmp/xtrace_merge_trace${idx}.perfetto" > "${log_dest}" &
     pids+=($!)
   done
 
-  trap 'echo ; echo "Please wait: copying traces from devices..." ; kill -USR1 "${pids[@]}" 2>/dev/null' SIGINT
+  if [[ "${skip_tracing}" == false ]]; then
+    local ctrlc_count=0
+    trap '
+      ctrlc_count=$((ctrlc_count + 1))
+      if [[ ${ctrlc_count} -eq 1 ]]; then
+        kill -USR1 "${pids[@]}" 2>/dev/null
+      elif [[ ${ctrlc_count} -eq 2 ]]; then
+        echo "(Press Ctrl-C again to abort and lose the trace.)" >&2
+        trap - SIGINT SIGUSR1
+      fi
+    ' SIGINT SIGUSR1
+  fi
   local any_running=true
   while [[ "${any_running}" == true ]]; do
     any_running=false
@@ -851,7 +868,7 @@ run_multi_device_trace() {
       wait "${pids[@]}" 2>/dev/null
     fi
   done
-  trap - SIGINT
+  trap - SIGINT SIGUSR1
 
   for (( i = 0; i < num_devs; i++ )); do
     local dev="${target_devs[${i}]}"
@@ -939,7 +956,7 @@ execute_xtrace_on_selected_devices() {
       sub_args+=("${arg}")
     done
 
-    run_multi_device_trace true "${#selected_devices[@]}" "${selected_devices[@]}" "${sub_args[@]}"
+    run_multi_device_trace true true "${#selected_devices[@]}" "${selected_devices[@]}" "${sub_args[@]}"
     exit 0
   fi
 }
@@ -987,10 +1004,8 @@ do_merge_trace() {
   if [[ "${time_ms}" != "0" ]]; then
     time_string=" for ${time_ms} ms..."
   fi
-  echo "Tracing ${model1} and ${model2} ${time_string}"
 
-  local sub_args=("--no-frame-stats")
-  local has_no_open=false
+  local sub_args=("--no-frame-stats" "--no-open" "--atrace-apps" "com.google.android.glasses.core")
   local num_args="$#"
   local all_args=("$@")
   for (( idx = 0; idx < num_args; idx++ )); do
@@ -998,26 +1013,14 @@ do_merge_trace() {
     if [[ "${arg}" = "--merge" ]] || [[ "${arg}" = "--subshell-quiet" ]]; then
       continue
     fi
-    if [[ "${arg}" = "--adb" ]] && (( idx + 1 < num_args )); then
-      idx=$((idx+1))
-      continue
-    fi
-    if [[ "${arg}" = "--no-open" ]]; then
-      has_no_open=true
-    fi
-    if [[ "${arg}" = "-o" ]] && (( idx + 1 < num_args )); then
+    if [[ "${arg}" = "--adb" ]] || [[ "${arg}" = "-o" ]]; then
       idx=$((idx+1))
       continue
     fi
     sub_args+=("${arg}")
   done
-  if [[ "${has_no_open}" = false ]]; then
-    sub_args+=("--no-open")
-  fi
-  sub_args+=("--subshell-quiet")
-  sub_args+=("--atrace-apps" "com.google.android.glasses.core")
 
-  run_multi_device_trace false "${#devices[@]}" "${devices[@]}" "${sub_args[@]}"
+  run_multi_device_trace false false "${#devices[@]}" "${devices[@]}" "${sub_args[@]}"
 
   if [[ ! -f /tmp/xtrace_merge_trace1.perfetto ]] || [[ ! -f /tmp/xtrace_merge_trace2.perfetto ]]; then
     echo "error: merge trace recording failed (missing trace output from subshell)" >&2
@@ -1053,14 +1056,11 @@ do_merge_trace() {
 EOF
 
   if "${host_tools_dir}/trace_processor_shell" util merge -o "${output_file}" \
-      --manifest /tmp/xtrace_merge_manifest.json \
-      /tmp/xtrace_merge_trace1.perfetto /tmp/xtrace_merge_trace2.perfetto > /dev/null; then
+      --manifest "$($cygpathw /tmp/xtrace_merge_manifest.json)" \
+      "$($cygpathw /tmp/xtrace_merge_trace1.perfetto)" "$($cygpathw /tmp/xtrace_merge_trace2.perfetto)" > /dev/null; then
     du -hs "${output_file}"
     rm -f /tmp/xtrace_merge_trace1.perfetto /tmp/xtrace_merge_trace2.perfetto /tmp/xtrace_merge_manifest.json
-
-    if [[ "${has_no_open}" = false ]]; then
-      autoload
-    fi
+    autoload
   fi
 }
 
