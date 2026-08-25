@@ -39,23 +39,11 @@ available_atrace_categories() {
   echo $(adb shell atrace --list 2> /dev/null | sed -r 's/ *(.*) - .*/\1/g')
 }
 
-is_adb_root() {
-  if [[ -z "${_IS_ROOTED_STATUS}" ]]; then
-    adb root > /dev/null 2>&1
-    if adb shell 'su 0 whoami' 2> /dev/null | grep -q 'root'; then
-      _IS_ROOTED_STATUS=true
-    else
-      _IS_ROOTED_STATUS=false
-    fi
-  fi
-
-  [[ "${_IS_ROOTED_STATUS}" == true ]]
-}
-
 _ALL_ADB_DEVICES=()
 _ALL_ADB_DEVICE_STATUSES=()
 _READY_ADB_DEVICES=()
 _ADB_DEVICES_CACHED=false
+_IS_ANY_ROOTED_STATUS=""
 
 get_adb_devices() {
   if [[ "${_ADB_DEVICES_CACHED}" == false ]]; then
@@ -76,16 +64,46 @@ get_adb_devices() {
   fi
 }
 
-# echo if adb device is rooted.
+is_adb_root() {
+  if [[ -z "${_IS_ROOTED_STATUS}" ]]; then
+    adb root > /dev/null 2>&1
+    if adb shell 'su 0 whoami' 2> /dev/null | grep -q 'root'; then
+      _IS_ROOTED_STATUS=true
+    else
+      _IS_ROOTED_STATUS=false
+    fi
+  fi
+
+  [[ "${_IS_ROOTED_STATUS}" == true ]]
+}
+
+is_any_adb_root() {
+  if [[ -z "${_IS_ANY_ROOTED_STATUS}" ]]; then
+    get_adb_devices
+    _IS_ANY_ROOTED_STATUS=false
+    local dev
+    for dev in "${_READY_ADB_DEVICES[@]}"; do
+      adb -s "${dev}" root > /dev/null 2>&1
+      if adb -s "${dev}" shell 'su 0 whoami' 2> /dev/null | grep -q 'root'; then
+        _IS_ANY_ROOTED_STATUS=true
+        break
+      fi
+    done
+  fi
+
+  [[ "${_IS_ANY_ROOTED_STATUS}" == true ]]
+}
+
+# echo if any adb device is rooted.
 ecRT() {
-  if is_adb_root; then
+  if is_any_adb_root; then
     echo "$@"
   fi
 }
 
-# echo if adb device is unrooted.
+# echo if no adb device is rooted.
 ecNR() {
-  if ! is_adb_root; then
+  if ! is_any_adb_root; then
     echo "$@"
   fi
 }
@@ -339,11 +357,7 @@ is_local=false
 is_android=true
 time_ms=0
 include_ftrace_defaults=true
-if is_adb_root; then
-  include_kgsl_ftrace=true
-else
-  include_kgsl_ftrace=false
-fi
+include_kgsl_ftrace=""
 include_atrace_defaults=true
 include_perfetto_defaults=true
 symbolize_ksyms=false
@@ -433,19 +447,19 @@ duration_to_s() {
 
 verbose() {
   if [[ "${verbose_logs}" == true ]]; then
-    echo "$1"
+    echo "$@"
   fi
 }
 
 notquiet() {
   if [[ "${is_quiet}" == false ]]; then
-    echo "$1"
+    echo "$@"
   fi
 }
 
 echo_notsubshell() {
   if [[ "${is_subshell}" == false ]]; then
-    echo "$1"
+    echo "$@"
   fi
 }
 
@@ -612,7 +626,7 @@ for (( i = 0; i < num_args; i++ )); do
   elif [[ "${args[${i}]}" = "--disable-dynamic-policy" ]]; then
     disable_dynamic_policy=true
     skip_tracing=true
-  elif [[ "${args[${i}]}" = "--disable-gpu-preemption" ]] && is_adb_root; then
+  elif [[ "${args[${i}]}" = "--disable-gpu-preemption" ]]; then
     disable_gpu_preemption=true
     skip_tracing=true
   elif [[ "${args[${i}]}" = "--lock-head" ]]; then
@@ -1030,22 +1044,80 @@ do_merge_trace() {
   title_args+=("${model1// /_}" "${model2// /_}")
   set_title
 
+  rm -f /tmp/xtrace_merge_manifest.json
+
+  local offset_query_file="${xtrace_dir}/queries/clock_offset.sql"
+  local query_path="$($cygpathw "${offset_query_file}")"
+  local trace1_path="$($cygpathw /tmp/xtrace_merge_trace1.perfetto)"
+  local trace2_path="$($cygpathw /tmp/xtrace_merge_trace2.perfetto)"
+
+  local device1_offset=$("${host_tools_dir}/trace_processor_shell" -q "${query_path}" "${trace1_path}" \
+                         2>/dev/null | tail -n +2 | tr -d '"' | tr -d '\r' | tr -d ' ')
+  local device2_offset=$("${host_tools_dir}/trace_processor_shell" -q "${query_path}" "${trace2_path}" \
+                         2>/dev/null | tail -n +2 | tr -d '"' | tr -d '\r' | tr -d ' ')
+
+  local dev1_has_offset=false
+  local dev2_has_offset=false
+
+  if [ "${device1_offset}" -ne 0 ] 2>/dev/null; then
+    dev1_has_offset=true
+    echo "Using PeripheralClockOffsetNs from ${model1}: ${device1_offset}"
+  fi
+
+  if [ "${device2_offset}" -ne 0 ] 2>/dev/null; then
+    dev2_has_offset=true
+    echo "Using PeripheralClockOffsetNs from ${model2}: ${device2_offset}"
+  fi
+
+  if [[ "${dev1_has_offset}" == true ]] && [[ "${dev2_has_offset}" == true ]]; then
+    echo "error: both devices have a PeripheralClockOffsetNs value" >&2
+    exit 1
+  fi
+
+  local clock="REALTIME"
+  local device1_clocks=""
+  local device2_clocks=""
+  if [[ "${dev1_has_offset}" == true ]]; then
+    clock="BOOTTIME"
+    device1_clocks="
+        \"clocks\": {
+          \"clock\": \"BOOTTIME\", \"sync_to\": {
+            \"file\": \"xtrace_merge_trace2.perfetto\",
+            \"clock\": \"BOOTTIME\"
+          },
+          \"offset_ns\": ${device1_offset}
+        },"
+  elif [[ "${dev2_has_offset}" == true ]]; then
+    clock="BOOTTIME"
+    device2_clocks="
+        \"clocks\": {
+          \"clock\": \"BOOTTIME\", \"sync_to\": {
+            \"file\": \"xtrace_merge_trace1.perfetto\",
+            \"clock\": \"BOOTTIME\"
+          },
+          \"offset_ns\": ${device2_offset}
+        },"
+  else
+    echo "Using wallclock (REALTIME), so there may be some misalignment."
+  fi
   cat << EOF > /tmp/xtrace_merge_manifest.json
 {
   "perfetto_manifest": {
     "version": 1,
     "trace_time": {
-      "clock": "REALTIME"
+      "clock": "${clock}"
     },
     "files": [
       {
         "path": "xtrace_merge_trace1.perfetto",
+        ${device1_clocks}
         "machine": {
           "name": "${model1}"
         }
       },
       {
         "path": "xtrace_merge_trace2.perfetto",
+        ${device2_clocks}
         "machine": {
           "name": "${model2}"
         }
@@ -1059,10 +1131,14 @@ EOF
       --manifest "$($cygpathw /tmp/xtrace_merge_manifest.json)" \
       "$($cygpathw /tmp/xtrace_merge_trace1.perfetto)" "$($cygpathw /tmp/xtrace_merge_trace2.perfetto)" > /dev/null; then
     du -hs "${output_file}"
-    rm -f /tmp/xtrace_merge_trace1.perfetto /tmp/xtrace_merge_trace2.perfetto /tmp/xtrace_merge_manifest.json
+    rm -f /tmp/xtrace_merge_trace1.perfetto /tmp/xtrace_merge_trace2.perfetto
     autoload
   fi
 }
+
+#
+# Args post-processing
+#
 
 # If counters are requested, switch to renderstage mode if also using --gpu2.
 if [[ "${include_counters}" == true ]]; then
@@ -1160,6 +1236,8 @@ kill_sleeper_daemon() {
 
 target_name="local"
 if [[ "${is_local}" == false ]] && [[ "${from_file}" == false ]]; then
+  # We are tracing a device(s) over adb.
+
   if [[ "${#adb_targets[@]}" -gt 0 ]]; then
     process_adb_targets
   fi
@@ -1172,6 +1250,8 @@ if [[ "${is_local}" == false ]] && [[ "${from_file}" == false ]]; then
   if [[ "${#selected_devices[@]}" -gt 0 ]]; then
     execute_xtrace_on_selected_devices
   fi
+
+  # Continuing here when we either have only one adb device, or we have ANDROID_SERIAL set.
 
   wait_output=$(adb wait-for-device 2>&1)
   wait_status=$?
@@ -1195,9 +1275,8 @@ if [[ "${is_local}" == false ]] && [[ "${from_file}" == false ]]; then
         echo "Device ${dev_idx}: ${st} (target with --adb ${dev_idx} or --adb ${dev_id})"
         dev_idx=$((dev_idx + 1))
       done
-      if [[ "${#_ALL_ADB_DEVICES[@]}" -gt 1 ]]; then
-        echo "Tip: Use '--adb all' to target all ready devices, or pass multiple '--adb X' flags to target a specific set of devices."
-      fi
+      echo "Tip: Use '--adb all' to run the xtrace command on all ready devices, or use multiple '--adb X' flags to target specific device(s)."
+      echo "Tip: Use '--merge' to trace two devices simultaneously."
     fi
     exit 1
   fi
@@ -1206,6 +1285,14 @@ if [[ "${is_local}" == false ]] && [[ "${from_file}" == false ]]; then
 
   if [[ "${is_info}" == true ]]; then
     show_info
+  fi
+
+  if [[ -z "${include_kgsl_ftrace}" ]]; then
+    if is_adb_root; then
+      include_kgsl_ftrace=true
+    else
+      include_kgsl_ftrace=false
+    fi
   fi
 
   if [[ "${enable_sampling}" == true ]] && [[ -z "${sampling_target}" ]]; then
@@ -1248,7 +1335,7 @@ if [[ "${is_local}" == false ]] && [[ "${from_file}" == false ]]; then
     echo "Dynamic Policy is disabled. Reboot to reenable it."
   fi
 
-  if [[ "${disable_gpu_preemption}" == true ]]; then
+  if [[ "${disable_gpu_preemption}" == true ]] && is_adb_root; then
     if [[ $(adb shell getprop compositor.high_priority) != 0 ]]; then
       adb shell setprop compositor.high_priority 0
       do_stop_start=true
