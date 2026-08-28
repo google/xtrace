@@ -182,8 +182,8 @@ show_help_and_exit() {
   echo "  [-p /path/to/perfetto]   Path to perfetto tool if it is not in \$PATH"
   echo "  [-c /path/to/config]     Use existing textproto config file instead of generating it"
   echo "  [-i <period_ms>]         Incremental update period in ms"
-  echo "  [--screenshot]           [XR] Capture a screenshot alongside the trace"
-  ecRT "  [--raw-screenshot]       [XR] Capture a raw screenshot alongside the trace"
+  echo "  [--screenshot[=<display>]] [XR] Capture a screenshot alongside the trace [with display index]"
+  ecRT "  [--raw-screenshot[=<display>]] [XR] Capture a raw screenshot alongside the trace"
   ecRT "  [--lock-frequencies]     [XR] Lock CPU, GPU and DDR frequencies for more consistent measurements."
   ecRT "                           Note: Performance will be different from normal device conditions. This"
   ecRT "                            option is useful for A/B testing different CPU or GPU code to measure"
@@ -324,7 +324,9 @@ push_config=true
 use_binary_config=false
 auto_open=true
 screenshot=false
+screenshot_display_index=""
 raw_screenshot=false
+raw_screenshot_display_index=""
 lock_frequencies=false
 lock_head=''
 enable_gpu=false
@@ -648,8 +650,14 @@ for (( i = 0; i < num_args; i++ )); do
     skip_tracing=true
   elif [[ "${args[${i}]}" = "--screenshot" ]]; then
     screenshot=true
+  elif [[ "${args[${i}]}" == --screenshot=* ]]; then
+    screenshot=true
+    screenshot_display_index="${args[${i}]#*=}"
   elif [[ "${args[${i}]}" = "--raw-screenshot" ]]; then
     raw_screenshot=true
+  elif [[ "${args[${i}]}" == --raw-screenshot=* ]]; then
+    raw_screenshot=true
+    raw_screenshot_display_index="${args[${i}]#*=}"
   elif [[ "${args[${i}]}" = "--lock-frequencies" ]]; then
     lock_frequencies=true
   elif [[ "${args[${i}]}" = "--gpu" ]]; then
@@ -2412,14 +2420,19 @@ autoload
 
 cap_screenshot() {
   local raw="$1"
+  local target_index="$2"
   local target_raw=false
   local restore_raw=true
   local log_msg="Capturing screenshot..."
+  local suffix=""
+  local opt_name="screenshot"
 
   if [[ "${raw}" == true ]]; then
+    suffix="-raw"
     target_raw=true
     restore_raw=false
     log_msg="Capturing raw screenshot..."
+    opt_name="raw-screenshot"
   fi
 
   echo "${log_msg}"
@@ -2432,40 +2445,70 @@ cap_screenshot() {
     changed=true
   fi
 
-  # Check if there are multiple displays and select the one with HWC display 0
-  local display_id=""
   local displays
   displays=$(adb shell dumpsys SurfaceFlinger --display-id 2>/dev/null | tr -d '\r')
-  local display_count
-  display_count=$(echo "${displays}" | grep -c "^Display " || true)
+  local display_lines=()
+  if [[ -n "${displays}" ]]; then
+    while IFS= read -r line; do
+      [[ -n "${line}" ]] && display_lines+=("${line}")
+    done <<< "$(echo "${displays}" | grep "^Display " || true)"
+  fi
+  local display_count=${#display_lines[@]}
 
-  if [[ ${display_count} -gt 1 ]]; then
-    local target_line
-    target_line=$(echo "${displays}" | grep "HWC display 0" || true)
-    if [[ -n "${target_line}" ]]; then
-      display_id=$(echo "${target_line}" | cut -d' ' -f2)
+  local target_indices=()
+  if [[ -n "${target_index}" ]]; then
+    if [[ "${target_index}" =~ ^[0-9]+$ ]] && [[ "${target_index}" -ge 0 ]] && [[ "${target_index}" -lt "${display_count}" ]]; then
+      target_indices+=("${target_index}")
+    else
+      echo "warning: display index ${target_index} not found (found ${display_count} displays)" >&2
+      target_indices+=("")
+    fi
+  else
+    if [[ ${display_count} -gt 1 ]]; then
+      notquiet "Capturing all displays. To capture only one:"
+      for (( idx = 0; idx < display_count; idx++ )); do
+        notquiet "  --${opt_name}=${idx}: ${display_lines[${idx}]}"
+      done
+    fi
+    if [[ ${display_count} -gt 0 ]]; then
+      for (( idx = 0; idx < display_count; idx++ )); do
+        target_indices+=("${idx}")
+      done
+    else
+      target_indices+=("")
     fi
   fi
 
-  if [[ -n "${display_id}" ]]; then
-    adb exec-out screencap -d "${display_id}" -p > "${output_file}.png"
-  else
-    adb exec-out screencap -p > "${output_file}.png"
-  fi
+  for idx in "${target_indices[@]}"; do
+    local display_id=""
+    local cur_suffix="${suffix}"
+    if [[ -n "${idx}" ]]; then
+      display_id=$(echo "${display_lines[${idx}]}" | cut -d' ' -f2)
+      if [[ ${display_count} -gt 1 ]]; then
+        cur_suffix="${suffix}-${idx}"
+      fi
+    fi
+
+    local image_filename="${output_file}${cur_suffix}.png"
+    if [[ -n "${display_id}" ]]; then
+      adb exec-out screencap -d "${display_id}" -p > "${image_filename}"
+    else
+      adb exec-out screencap -p > "${image_filename}"
+    fi
+    du -hs "${image_filename}"
+  done
 
   if [[ "${changed}" == true ]]; then
     adb shell setprop cpm.raw_capture "${restore_raw}"
   fi
-
-  du -hs "${output_file}.png"
 }
 
 if [[ "${screenshot}" == true ]]; then
-  cap_screenshot false
+  cap_screenshot false "${screenshot_display_index}"
 fi
 
 if [[ "${raw_screenshot}" == true ]]; then
-  cap_screenshot true
+  cap_screenshot true "${raw_screenshot_display_index}"
 fi
 
 if [[ "${lock_frequencies}" == true ]]; then
