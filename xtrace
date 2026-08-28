@@ -184,6 +184,9 @@ show_help_and_exit() {
   echo "  [-i <period_ms>]         Incremental update period in ms"
   echo "  [--screenshot[=<display>]] [XR] Capture a screenshot alongside the trace [with display index]"
   ecRT "  [--raw-screenshot[=<display>]] [XR] Capture a raw screenshot alongside the trace"
+  echo "  [--video]                Record display video in the trace (requires perfetto v50+)"
+  echo "  [--video-scale <scale>]  Display video resolution scale factor (default: 0.5)"
+  echo "  [--video-bps <bps>]      Display video bitrate in bits per second (default: 8000000)"
   ecRT "  [--lock-frequencies]     [XR] Lock CPU, GPU and DDR frequencies for more consistent measurements."
   ecRT "                           Note: Performance will be different from normal device conditions. This"
   ecRT "                            option is useful for A/B testing different CPU or GPU code to measure"
@@ -341,6 +344,9 @@ gpu2_low_overhead=false
 include_counters=false
 include_renderstage_counters=false
 include_android_thermal_config=false
+include_video=false
+video_scale=0.5
+video_bps=8000000
 sql_path=''
 ui_sql_path=""
 gpu_stats_filename="gpu_stats2.sql"
@@ -678,6 +684,17 @@ for (( i = 0; i < num_args; i++ )); do
   elif [[ "${args[${i}]}" = "--vk" ]]; then
     include_vulkan=true
     title_args+=("vk")
+  elif [[ "${args[${i}]}" = "--video" ]]; then
+    include_video=true
+    title_args+=("video")
+  elif [[ "${args[${i}]}" = "--video-scale" ]]; then
+    i=$((i+1))
+    video_scale="${args[${i}]}"
+    include_video=true
+  elif [[ "${args[${i}]}" = "--video-bps" ]]; then
+    i=$((i+1))
+    video_bps="${args[${i}]}"
+    include_video=true
   elif [[ "${args[${i}]}" = "--no-atrace-apps" ]]; then
     atrace_apps=()
     title_args+=("no-atrace-apps")
@@ -1920,6 +1937,28 @@ data_sources {
 EOL
   fi
 
+  if [[ "${include_video}" == true ]]; then
+    if [[ "${perfetto_version_major}" -ge 50 ]]; then
+      cat >>"${config_filepath}" <<EOL
+data_sources {
+  config {
+    name: "android.display.video"
+    display_video_config {
+      scale: ${video_scale}
+      format: FORMAT_H264
+      key_frame_interval_secs: 2
+      bitrate_bps: ${video_bps}
+      max_stream_size_bytes: 100000000
+    }
+  }
+}
+EOL
+    else
+      echo "warning: --video requires perfetto v50 or later on the device" \
+        "(found v${perfetto_version_major:-unknown})" >&2
+    fi
+  fi
+
   if [[ "${include_android_thermal_config}" == true ]]; then
     cat >>"${config_filepath}" <<EOL
 data_sources: {
@@ -2340,6 +2379,10 @@ if [[ "${use_binary_config}" == true ]]; then
   config_filepath="${config_filepath}.bin"
 else
   extra_args="--txt"
+fi
+
+if [[ "${include_video}" == true ]] && [[ "${perfetto_version_major}" -ge 50 ]]; then
+  adb shell setprop debug.tracing_video_allowed true
 fi
 
 android_config="/data/misc/perfetto-configs/config"
