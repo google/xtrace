@@ -31,6 +31,7 @@ WITH
   _with_args AS (
     SELECT
       event.*,
+      MIN(CASE key WHEN 'id' THEN int_value END) AS ctxt_id,
       MIN(CASE key WHEN 'active' THEN int_value END) AS active,
       MIN(CASE key WHEN 'prio' THEN int_value END) AS prio,
       MIN(CASE key WHEN 'retire' THEN int_value END) AS retire,
@@ -44,7 +45,7 @@ WITH
       ON args.arg_set_id = event.arg_set_id
     WHERE
       args.key IN (
-        'active', 'prio', 'retire', 'start', 'submitted_to_rb', 'ticks', 'timestamp',
+        'id', 'active', 'prio', 'retire', 'start', 'submitted_to_rb', 'ticks', 'timestamp',
         'retired_on_gmu')
     GROUP BY event.arg_set_id
     ORDER BY event.ts
@@ -56,7 +57,7 @@ WITH
         CASE
           WHEN name = 'adreno_cmdbatch_queued' OR name = 'kgsl_adreno_cmdbatch_queued' THEN id
           END)
-        OVER (PARTITION BY gpu_queue_id ORDER BY ts RANGE 1e9 PRECEDING) AS queue_id
+        OVER (PARTITION BY ctxt_id, gpu_queue_id ORDER BY ts RANGE 1e9 PRECEDING) AS queue_id
     FROM _with_args
     ORDER BY ts
   ),
