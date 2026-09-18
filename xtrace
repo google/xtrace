@@ -66,7 +66,12 @@ get_adb_devices() {
 
 is_adb_root() {
   if [[ -z "${_IS_ROOTED_STATUS}" ]]; then
-    adb root > /dev/null 2>&1
+    local try_root
+    try_root=$(adb root 2>&1)
+    if [[ "${try_root}" == *"restarting"* ]]; then
+      sleep 1
+      adb wait-for-device
+    fi
     if adb shell 'su 0 whoami' 2> /dev/null | grep -q 'root'; then
       _IS_ROOTED_STATUS=true
     else
@@ -182,6 +187,7 @@ show_help_and_exit() {
   echo "  [-p /path/to/perfetto]   Path to perfetto tool if it is not in \$PATH"
   echo "  [-c /path/to/config]     Use existing textproto config file instead of generating it"
   echo "  [-i <period_ms>]         Incremental update period in ms"
+  echo "  [--reboot]               Trace the device boot sequence (device will be rebooted)"
   echo "  [--screenshot[=<display>]] [XR] Capture a screenshot alongside the trace [with display index]"
   ecRT "  [--raw-screenshot[=<display>]] [XR] Capture a raw screenshot alongside the trace"
   echo "  [--video]                Record display video in the trace (requires perfetto v50+)"
@@ -363,6 +369,7 @@ query_output_format=text
 verbose_sql_logs=false
 is_local=false
 is_android=true
+trace_boot=false
 time_ms=0
 include_ftrace_defaults=true
 include_kgsl_ftrace=""
@@ -728,6 +735,9 @@ for (( i = 0; i < num_args; i++ )); do
   elif [[ "${args[${i}]}" = "--no-perfetto" ]]; then
     include_perfetto_defaults=false
     title_args+=("no-perfetto")
+  elif [[ "${args[${i}]}" = "--reboot" ]]; then
+    trace_boot=true
+    title_args+=("boot")
   elif [[ "${args[${i}]}" = "--symbolize-ksyms" ]]; then
     symbolize_ksyms=true
   elif [[ "${args[${i}]}" = "--perf-dump" ]]; then
@@ -2369,7 +2379,7 @@ if [[ "${is_local}" == true ]]; then
   exit 0
 fi
 
-if [[ "${use_binary_config}" == true ]]; then
+if [[ "${use_binary_config}" == true ]] && [[ "${trace_boot}" == false ]]; then
   "protoc" --encode=perfetto.protos.TraceConfig \
           "--proto_path=$($cygpathw "${xtrace_dir}")" \
           "$($cygpathw "${xtrace_dir}/third_party/perfetto/perfetto_config.proto")" \
@@ -2387,23 +2397,44 @@ fi
 
 android_config="/data/misc/perfetto-configs/config"
 android_trace="//data/misc/perfetto-traces/trace"
+if [[ "${trace_boot}" == true ]]; then
+  android_config="//data/misc/perfetto-configs/boottrace.pbtxt"
+  android_trace="//data/misc/perfetto-traces/boottrace.perfetto-trace"
+fi
+all_trace_files="//data/misc/perfetto-configs/config \
+    //data/misc/perfetto-configs/boottrace.pbtxt \
+    //data/misc/perfetto-traces/trace \
+    //data/misc/perfetto-traces/boottrace.perfetto-trace"
+
+perfetto_pid=""
 
 # Stop old trace sessions and delete old trace files to avoid ownership errors.
-adb shell -x "pkill -x perfetto; rm -f ${android_trace}; " > /dev/null 2>&1
+adb shell -x "pkill -x perfetto; rm -f ${all_trace_files}; " > /dev/null 2>&1
 
-# Kick off background perfetto trace.
-if adb push $($cygpathw ${config_filepath}) ${android_config} > /dev/null 2>&1 ; then
-  if ! perfetto_pid=$(adb shell perfetto -c ${android_config} "${extra_args}" \
-                    --background --o "${android_trace}" 2> ${verbose_err}); then
-    echo "perfetto error: try again with --verbose to see errors."
+if [[ "${trace_boot}" == true ]]; then
+  if ! adb push $($cygpathw ${config_filepath}) ${android_config} > /dev/null 2>&1 ; then
+    echo "error: failed to push boot config to ${android_config}" >&2
     exit 1
   fi
+  adb shell setprop persist.debug.perfetto.boottrace 1 || exit 1
+  echo_notsubshell "Rebooting ${target_name}..."
+  adb reboot
+  sleep 2
 else
-  [[ "${push_config}" == true ]] &&
-      echo "Warning: could not push config, so retry with --no-push-config if there are errors"
-  if ! perfetto_pid=$(adb shell perfetto -c - "${extra_args}" \
-                      --background --o "${android_trace}" < "${config_filepath}"); then
-    exit 1
+  # Kick off background perfetto trace.
+  if adb push $($cygpathw ${config_filepath}) ${android_config} > /dev/null 2>&1 ; then
+    if ! perfetto_pid=$(adb shell perfetto -c ${android_config} "${extra_args}" \
+                      --background --o "${android_trace}" 2> ${verbose_err}); then
+      echo "perfetto error: try again with --verbose to see errors."
+      exit 1
+    fi
+  else
+    [[ "${push_config}" == true ]] &&
+        echo "Warning: could not push config, so retry with --no-push-config if there are errors"
+    if ! perfetto_pid=$(adb shell perfetto -c - "${extra_args}" \
+                        --background --o "${android_trace}" < "${config_filepath}"); then
+      exit 1
+    fi
   fi
 fi
 
@@ -2434,15 +2465,67 @@ trap - SIGINT SIGUSR1
 # Kill all perfetto processes and wait for them to finish.
 echo_notsubshell "Please wait: copying trace from ${target_name}..."
 
-# Wait for device in case it was unplugged during the trace.
+# Wait for device in case it was unplugged or rebooted during the trace.
 adb wait-for-device
 
+if [[ "${trace_boot}" == true ]]; then
+  # Look for running perfetto process.
+  for (( retry = 0; retry < 3; retry++ )); do
+    perfetto_pid=$(adb shell "pidof perfetto 2> /dev/null || pgrep -x perfetto 2> /dev/null" | tr -d '\r\n')
+    [[ -n "${perfetto_pid}" ]] && break
+    echo "Looking for perfetto process on ${target_name}..."
+    sleep 1
+    adb wait-for-device
+  done
+  perfetto_pid=$(echo "$perfetto_pid" | awk '{print $1}')
+  if [[ -z "${perfetto_pid}" ]]; then
+    echo "error: perfetto process not found on ${target_name}, so the trace may have failed." >&2
+  fi
+fi
+
 # Wait for trace completion.
-# Now using inotifyd instead of attach, to be sure the file is fully written.
-# Android 16 changed the syntax from ::w to :w
-inotify_setup='inotify_suffix="::w"; [[ $(getprop ro.build.version.release) -ge 16 ]] && inotify_suffix=":w"'
-adb shell "${inotify_setup}; inotifyd - ${android_trace}\$inotify_suffix | head -n0 & sleep 1 ; kill ${perfetto_pid} ; wait ; \
-    pkill -x ${gpu_counter_producer}"
+# Waiting for perfetto process to exit to be sure the file is fully written.
+if [[ -n "${perfetto_pid}" ]]; then
+  wait_cmd="
+    kill -TERM ${perfetto_pid} 2>/dev/null
+    sleep 3
+
+    TIMEOUT=120
+    DOTS=0
+    while [ -d \"/proc/${perfetto_pid}\" ] && [ \$TIMEOUT -gt 0 ]; do
+      read -r proc_name 2>/dev/null < \"/proc/${perfetto_pid}/comm\"
+      [ \"\$proc_name\" = \"perfetto\" ] || break
+      [ \$DOTS -eq 0 ] && printf 'Waiting for perfetto to write ${android_trace} ' >&2
+      sleep 1
+      printf '.' >&2
+      DOTS=1
+      TIMEOUT=\$((TIMEOUT - 1))
+    done
+    [ \$DOTS -eq 1 ] && echo >&2
+
+    # Kill secondary producers
+    pkill -x ${gpu_counter_producer} 2>/dev/null
+
+    # Flush dirty pages from OS cache to storage hardware
+    sync \"${android_trace}\" 2>/dev/null || sync
+
+    if [ \$TIMEOUT -gt 0 ]; then
+      echo \"wait_cmd_done\"
+    fi
+  "
+
+  if ! adb shell "${wait_cmd}" | grep -q "wait_cmd_done"; then
+    sleep 1
+    adb wait-for-device
+    if ! adb shell "${wait_cmd}" | grep -q "wait_cmd_done"; then
+      sleep 1
+      adb wait-for-device
+      adb shell "${wait_cmd}" | grep -q "wait_cmd_done"
+    fi
+  fi
+else
+  adb shell "pkill -x ${gpu_counter_producer}" > /dev/null 2>&1
+fi
 
 if ! adb pull ${android_trace} ${output_file} > /dev/null 2>&1; then
   sleep 1
