@@ -250,84 +250,204 @@ top_processes_pivoted AS (
     JOIN window_bounds wb USING (row_id)
     GROUP BY row_id
 ),
+/* All threads of the target processes. */
+target_threads AS MATERIALIZED (
+    SELECT DISTINCT t.utid, p.name AS proc_name
+    FROM thread t
+    JOIN process p USING (upid)
+    WHERE p.name IN (SELECT ProcessName FROM window_bounds)
+),
+window_extent AS MATERIALIZED (
+    SELECT MIN(w_start) AS ext_start, MAX(w_end) AS ext_end FROM window_bounds
+),
+/* Single pass over sched / thread_state for the target threads within the window extent.
+   Joining these large tables per window directly can pick very slow query plans. */
+target_sched AS MATERIALIZED (
+    SELECT sc.utid, sc.ts, sc.dur, sc.priority
+    FROM sched sc, window_extent we
+    WHERE sc.utid IN (SELECT utid FROM target_threads)
+      AND sc.ts < we.ext_end AND sc.ts + sc.dur > we.ext_start
+),
+target_runnable AS MATERIALIZED (
+    SELECT ts.utid, ts.ts, ts.dur
+    FROM thread_state ts, window_extent we
+    WHERE ts.utid IN (SELECT utid FROM target_threads)
+      AND ts.state IN ('R', 'R+')
+      AND ts.ts < we.ext_end AND ts.ts + ts.dur > we.ext_start
+),
+/* Sched slices of the window's process threads that overlap each window. */
+window_sched AS MATERIALIZED (
+    SELECT wb.row_id, sc.utid, sc.ts, sc.dur, sc.priority
+    FROM window_bounds wb
+    JOIN target_threads tt ON tt.proc_name = wb.ProcessName
+    JOIN target_sched sc ON sc.utid = tt.utid
+    WHERE sc.ts < wb.w_end AND sc.ts + sc.dur > wb.w_start
+),
+/* Runnable (R / R+) thread states of the window's process threads that overlap each window. */
+window_runnable AS MATERIALIZED (
+    SELECT wb.row_id, tr.utid, tr.ts, tr.dur
+    FROM window_bounds wb
+    JOIN target_threads tt ON tt.proc_name = wb.ProcessName
+    JOIN target_runnable tr ON tr.utid = tt.utid
+    WHERE tr.ts < wb.w_end AND tr.ts + tr.dur > wb.w_start
+),
+/* Highest scheduling priority (lowest number) each thread of the process had
+   within each window. Kernel prio: <100 RT, 100-119 elevated, 120 default (nice 0), >120 background. */
+thread_window_prio AS MATERIALIZED (
+    SELECT row_id, utid, MIN(priority) AS priority
+    FROM window_sched
+    GROUP BY row_id, utid
+),
+/* Fallback for threads that did not run in a window. */
+thread_trace_prio AS MATERIALIZED (
+    SELECT utid, MIN(priority) AS priority
+    FROM sched
+    WHERE utid IN (SELECT utid FROM target_threads)
+    GROUP BY utid
+),
 runnable_durations AS (
     SELECT
-        wb.row_id,
+        wr.row_id,
+        SUM(MIN(wr.ts + wr.dur, wb.w_end) - MAX(wr.ts, wb.w_start)) AS total_runnable_dur,
         SUM(
             CASE
-                WHEN ts.ts + ts.dur > wb.w_start AND ts.ts < wb.w_end
-                THEN (MIN(ts.ts + ts.dur, wb.w_end) - MAX(ts.ts, wb.w_start))
+                WHEN COALESCE(twp.priority, ttp.priority) < 120
+                THEN (MIN(wr.ts + wr.dur, wb.w_end) - MAX(wr.ts, wb.w_start))
                 ELSE 0
             END
-        ) AS total_runnable_dur
-    FROM window_bounds wb
-    JOIN process p ON wb.ProcessName = p.name
-    JOIN thread t ON p.upid = t.upid
-    JOIN thread_state ts ON t.utid = ts.utid
-    WHERE ts.state IN ('R', 'R+')
-    GROUP BY wb.row_id
+        ) AS hi_prio_runnable_dur
+    FROM window_runnable wr
+    JOIN window_bounds wb USING (row_id)
+    LEFT JOIN thread_window_prio twp ON twp.row_id = wr.row_id AND twp.utid = wr.utid
+    LEFT JOIN thread_trace_prio ttp ON ttp.utid = wr.utid
+    GROUP BY wr.row_id
 ),
-slices_in_windows AS (
+/* Slices of the window's process threads, excluding low priority background threads
+   (based on the thread's highest priority within the window). */
+slices_in_windows AS MATERIALIZED (
     SELECT
         wb.row_id,
+        s.id AS slice_id,
         s.name AS event_name,
-        s.dur
+        s.ts,
+        s.dur,
+        t.utid,
+        t.name AS thread_name,
+        COALESCE(twp.priority, ttp.priority) AS thread_priority
     FROM window_bounds wb
     JOIN process p ON wb.ProcessName = p.name
     JOIN thread t ON p.upid = t.upid
     JOIN thread_track tr ON t.utid = tr.utid
     JOIN slice s ON tr.id = s.track_id
-    JOIN (
-        SELECT utid, priority
-        FROM sched_slice
-        GROUP BY utid
-    ) ss ON t.utid = ss.utid
+    LEFT JOIN thread_window_prio twp ON twp.row_id = wb.row_id AND twp.utid = t.utid
+    LEFT JOIN thread_trace_prio ttp ON ttp.utid = t.utid
     WHERE s.ts >= wb.w_start AND s.ts + s.dur <= wb.w_end
+      AND s.dur >= 0
       AND s.name IS NOT NULL
-      AND ss.priority <= 130
+      AND COALESCE(twp.priority, ttp.priority) <= 130
 ),
-window_slice_stats AS (
+ranked_instances AS (
     SELECT
-        row_id,
-        event_name,
-        AVG(dur) AS avg_dur,
-        MAX(dur) AS max_dur
+        *,
+        ROW_NUMBER() OVER (PARTITION BY row_id, event_name ORDER BY dur DESC) AS inst_rank
     FROM slices_in_windows
-    GROUP BY row_id, event_name
 ),
 good_slice_stats AS (
-    SELECT event_name, avg_dur AS good_dur
-    FROM window_slice_stats
+    SELECT event_name, AVG(dur) AS good_dur
+    FROM slices_in_windows
     WHERE row_id = 11
+    GROUP BY event_name
 ),
+/* Worst (longest) instance of each event per drop window. */
 bad_slice_stats AS (
-    SELECT row_id, event_name, max_dur AS bad_dur
-    FROM window_slice_stats
-    WHERE row_id != 11
-),
-merged_stats AS (
-    SELECT
-        bss.row_id,
-        bss.event_name,
-        gss.good_dur,
-        bss.bad_dur,
-        (bss.bad_dur - COALESCE(gss.good_dur, 0)) AS dur_difference
-    FROM bad_slice_stats bss
-    LEFT JOIN good_slice_stats gss USING (event_name)
+    SELECT row_id, event_name, slice_id, dur AS bad_dur
+    FROM ranked_instances
+    WHERE row_id != 11 AND inst_rank = 1
 ),
 ranked_differences AS (
     SELECT
-        *,
-        ROW_NUMBER() OVER (PARTITION BY row_id ORDER BY dur_difference DESC) AS diff_rank
-    FROM merged_stats
+        bss.row_id,
+        bss.event_name,
+        bss.slice_id,
+        gss.good_dur,
+        bss.bad_dur,
+        ROW_NUMBER() OVER (PARTITION BY bss.row_id ORDER BY (bss.bad_dur - COALESCE(gss.good_dur, 0)) DESC) AS diff_rank
+    FROM bad_slice_stats bss
+    LEFT JOIN good_slice_stats gss USING (event_name)
+),
+top_differences AS MATERIALIZED (
+    SELECT * FROM ranked_differences WHERE diff_rank <= 3
+),
+/* Only compute the CPU state breakdown for slices that are reported:
+   the worst instances of the top events and the nominal instances of the same events. */
+breakdown_slices AS MATERIALIZED (
+    SELECT sw.*
+    FROM slices_in_windows sw
+    WHERE sw.slice_id IN (SELECT slice_id FROM top_differences)
+       OR (sw.row_id = 11 AND sw.event_name IN (SELECT event_name FROM top_differences))
+),
+/* On-CPU time and highest priority while each slice was running. */
+slice_sched AS (
+    SELECT
+        bs.slice_id,
+        SUM(MIN(sc.ts + sc.dur, bs.ts + bs.dur) - MAX(sc.ts, bs.ts)) AS run_dur,
+        MIN(sc.priority) AS priority
+    FROM breakdown_slices bs
+    JOIN window_sched sc ON sc.row_id = bs.row_id AND sc.utid = bs.utid
+    WHERE sc.ts < bs.ts + bs.dur AND sc.ts + sc.dur > bs.ts
+    GROUP BY bs.slice_id
+),
+/* Runnable (preempted / waiting for CPU) time during each slice. */
+slice_runnable AS (
+    SELECT
+        bs.slice_id,
+        SUM(MIN(wr.ts + wr.dur, bs.ts + bs.dur) - MAX(wr.ts, bs.ts)) AS rbl_dur
+    FROM breakdown_slices bs
+    JOIN window_runnable wr ON wr.row_id = bs.row_id AND wr.utid = bs.utid
+    WHERE wr.ts < bs.ts + bs.dur AND wr.ts + wr.dur > bs.ts
+    GROUP BY bs.slice_id
+),
+slice_breakdown AS MATERIALIZED (
+    SELECT
+        bs.row_id,
+        bs.slice_id,
+        bs.event_name,
+        bs.thread_name,
+        COALESCE(ssc.run_dur, 0) AS run_dur,
+        COALESCE(sr.rbl_dur, 0) AS rbl_dur,
+        COALESCE(ssc.priority, bs.thread_priority) AS priority
+    FROM breakdown_slices bs
+    LEFT JOIN slice_sched ssc USING (slice_id)
+    LEFT JOIN slice_runnable sr USING (slice_id)
+),
+good_breakdown AS (
+    SELECT event_name, AVG(run_dur) AS good_run, AVG(rbl_dur) AS good_rbl
+    FROM slice_breakdown
+    WHERE row_id = 11
+    GROUP BY event_name
+),
+ranked_differences_desc AS (
+    SELECT
+        td.row_id,
+        td.diff_rank,
+        /* Format: "good -> bad (run good -> bad; rbl good -> bad): prio:thread:event" (ms).
+           No commas since the output is CSV. Blocked time = wall - run - rbl. */
+        printf('%.1f -> %.1f (run %.1f -> %.1f; rbl %.1f -> %.1f): %d:%s:%s',
+               COALESCE(td.good_dur, 0) / 1e6, td.bad_dur / 1e6,
+               COALESCE(gb.good_run, 0) / 1e6, sb.run_dur / 1e6,
+               COALESCE(gb.good_rbl, 0) / 1e6, sb.rbl_dur / 1e6,
+               sb.priority, COALESCE(sb.thread_name, '?'), td.event_name) AS event_desc
+    FROM top_differences td
+    JOIN slice_breakdown sb USING (slice_id)
+    LEFT JOIN good_breakdown gb ON gb.event_name = td.event_name
 ),
 top_events_pivoted AS (
     SELECT
         row_id,
-        MAX(CASE WHEN diff_rank = 1 THEN printf('%.1f -> %.1f: %s', COALESCE(good_dur, 0) / 1e6, bad_dur / 1e6, event_name) ELSE NULL END) AS top_event_diff1,
-        MAX(CASE WHEN diff_rank = 2 THEN printf('%.1f -> %.1f: %s', COALESCE(good_dur, 0) / 1e6, bad_dur / 1e6, event_name) ELSE NULL END) AS top_event_diff2,
-        MAX(CASE WHEN diff_rank = 3 THEN printf('%.1f -> %.1f: %s', COALESCE(good_dur, 0) / 1e6, bad_dur / 1e6, event_name) ELSE NULL END) AS top_event_diff3
-    FROM ranked_differences
+        MAX(CASE WHEN diff_rank = 1 THEN event_desc ELSE NULL END) AS top_event_diff1,
+        MAX(CASE WHEN diff_rank = 2 THEN event_desc ELSE NULL END) AS top_event_diff2,
+        MAX(CASE WHEN diff_rank = 3 THEN event_desc ELSE NULL END) AS top_event_diff3
+    FROM ranked_differences_desc
     GROUP BY row_id
 )
 SELECT
@@ -341,6 +461,7 @@ SELECT
     printf('%g', ROUND(COALESCE(ogsi.other_gpu_dur_ms, 0) / COALESCE(NULLIF(cci.fractional_count, 0), wb.expected_frames), 3)) AS OtherGpuMSPF,
     printf('%g', ROUND(COALESCE(ttp.all_cpu_dur_ms, 0) / COALESCE(NULLIF(cci.fractional_count, 0), wb.expected_frames), 3)) AS CpuMSPF,
     printf('%g', ROUND(COALESCE(rd.total_runnable_dur / 1e6, 0) / COALESCE(NULLIF(cci.fractional_count, 0), wb.expected_frames), 3)) AS RunnableMSPF,
+    printf('%g', ROUND(COALESCE(rd.hi_prio_runnable_dur / 1e6, 0) / COALESCE(NULLIF(cci.fractional_count, 0), wb.expected_frames), 3)) AS RunnableHiPrioMSPF,
     ttp.top_thread1 AS TopThread1,
     printf('%g', ROUND(COALESCE(ttp.mspf1, 0) / COALESCE(NULLIF(cci.fractional_count, 0), wb.expected_frames), 3)) AS MSPF1,
     ttp.top_thread2 AS TopThread2,

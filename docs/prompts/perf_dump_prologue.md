@@ -29,13 +29,17 @@ Help pinpoint performance problems with deep knowledge of Android XR, Adreno GPU
 *   Each row looks at a window of trace data whose range is the Vsyncs count. For drop cases, the window goes from a few frames before the drops to 1 frame after. For the nominal case, the window is reduced to focus on the good frame data.
 *   The GpuMSPF is only the app GPU usage and the value can be a little off because of our small window size, but watch for increases compared to nominal. OtherGpuMSPF shows preemption overheads and other visible GPU activity.
 *   Watch for CpuIdlePct very low compared to nominal, as CPU saturation can cause drops.
-*   Watch TopEventDiffMS for differences in event durations that might indicate the root cause. Ex: 1.1 -> 7.0 indicates a ~6ms jump in that event's duration compared to nominal.
+*   Watch TopEventDiffMS for differences in event durations that might indicate the root cause. Format is `good -> bad (run good -> bad; rbl good -> bad): prio:thread:event` in ms, where "good" is the nominal average and "bad" is the longest instance in the drop window. Ex: `1.1 -> 7.0 (run 0.9 -> 1.0; rbl 0.1 -> 4.5): 98:UnityMain:Foo` indicates a ~6ms jump in Foo's duration compared to nominal, mostly from runnable time.
+    *   `run` is on-CPU time and `rbl` is runnable time (preempted or waiting for a CPU). The remaining time (wall - run - rbl) is blocked/sleeping (waiting on a lock, binder, etc).
+    *   Growth in `run` suggests more CPU work (or lower CPU frequency). Growth in `rbl` suggests CPU contention (cross-check CpuIdlePct and TopProcessPct).
+    *   `prio` is the Android thread priority during the event: <100 is RT, 120 is default.
 *   Watch the MSPF of the top threads. Engines like Unity are given RT prio on the main and render thread (ie: 98), but if they are using 9+ ms per frame they can still miss deadlines and cause a drop. If the top threads still look like main or render threads and they are not RT prio, then that's also a potential red flag (may need to fix engine code).
 *   If a GC finalizer thread shows on drop cases, a GC pause probably caused the drop.
 *   We may not see the SysUI GPU usage, so if there is any evidence of SysUI rendering in --frame-stats or --top (like high CPU usage) then that could explain app frame drops where it appears the app CPU and GPU usage is okay. If so, and this is not intended, then the user needs to trace again without triggering SysUI activity.
 *   If the problem appears to be background CPU activity from other system processes, then it can help to determine if this was a temporary issue or not by running another --perf-dump trace.
 *   TopProcessPct shows the % of window time consumed by the top processes. Can identify changes in background process behavior.
 *   RunnableMSPF shows the MS per frame that the process threads were in runnable state. This includes background threads that are not synchronized with per-frame code, so it may not always correlate well with frame drop cases where the time per frame is higher than the nominal case.
+*   RunnableHiPrioMSPF is the same as RunnableMSPF but only for threads < 120 priority, which are more likely to be on the critical path for a frame. An increase compared to nominal suggests CPU contention is delaying important app threads.
 
 ### --surface-stats tips:
 *   A surface in these stats is a full renderpass that resolves out to DDR.
