@@ -322,6 +322,26 @@ runnable_durations AS (
     LEFT JOIN thread_trace_prio ttp ON ttp.utid = wr.utid
     GROUP BY wr.row_id
 ),
+cpu_freq_spans AS MATERIALIZED (
+    SELECT
+        t.cpu,
+        c.ts,
+        c.value AS freq_khz,
+        LEAD(c.ts, 1, (SELECT MAX(ts) FROM ftrace_event)) OVER (PARTITION BY t.cpu ORDER BY c.ts) AS next_ts
+    FROM counter c
+    JOIN cpu_counter_track t ON c.track_id = t.id
+    WHERE t.name = 'cpufreq'
+),
+cpu_freq_durations AS (
+    SELECT
+        wb.row_id,
+        CAST(ROUND(SUM(fs.freq_khz * (MIN(fs.next_ts, wb.w_end) - MAX(fs.ts, wb.w_start)))
+                   / NULLIF(SUM(MIN(fs.next_ts, wb.w_end) - MAX(fs.ts, wb.w_start)), 0) / 1000.0) AS INTEGER) AS avg_cpu_freq_mhz
+    FROM window_bounds wb
+    JOIN cpu_freq_spans fs
+      ON fs.ts < wb.w_end AND fs.next_ts > wb.w_start
+    GROUP BY wb.row_id
+),
 /* Slices of the window's process threads, excluding low priority background threads
    (based on the thread's highest priority within the window). */
 slices_in_windows AS MATERIALIZED (
@@ -470,6 +490,7 @@ SELECT
     printf('%.2f', COALESCE(cci.fractional_count, 0)) AS AppFrames,
     wb.expected_frames AS Vsyncs,
     printf('%g', ROUND(COALESCE(cis.total_idle_dur * 100.0 / (wb.w_end - wb.w_start), 0), 1)) AS CpuIdlePct,
+    COALESCE(cfd.avg_cpu_freq_mhz, 0) AS CpuFreq,
     printf('%g', ROUND(COALESCE(gsi.gpu_dur_ms, 0) / COALESCE(NULLIF(cci.fractional_count, 0), wb.expected_frames), 3)) AS GpuMSPF,
     printf('%g', ROUND(COALESCE(ogsi.other_gpu_dur_ms, 0) / COALESCE(NULLIF(cci.fractional_count, 0), wb.expected_frames), 3)) AS OtherGpuMSPF,
     printf('%g', ROUND(COALESCE(ttp.all_cpu_dur_ms, 0) / COALESCE(NULLIF(cci.fractional_count, 0), wb.expected_frames), 3)) AS CpuMSPF,
@@ -498,4 +519,5 @@ LEFT JOIN client_cpu_intersections cci USING (row_id)
 LEFT JOIN gpu_slices_intersecting gsi USING (row_id)
 LEFT JOIN other_gpu_slices_intersecting ogsi USING (row_id)
 LEFT JOIN cpu_idle_sum cis USING (row_id)
+LEFT JOIN cpu_freq_durations cfd USING (row_id)
 ORDER BY cr.DropCount DESC;
