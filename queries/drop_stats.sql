@@ -311,93 +311,106 @@ ranked_instances AS (
         ROW_NUMBER() OVER (PARTITION BY row_id, event_name ORDER BY dur DESC) AS inst_rank
     FROM slices_in_windows
 ),
-good_slice_stats AS (
-    SELECT event_name, AVG(dur) AS good_dur
+good_vsyncs AS (
+    SELECT expected_frames FROM window_bounds WHERE row_id = 11
+),
+good_slice_stats AS MATERIALIZED (
+    SELECT
+        event_name,
+        COUNT(*) AS total_good_cnt,
+        SUM(dur) AS total_good_dur
     FROM slices_in_windows
     WHERE row_id = 11
     GROUP BY event_name
 ),
-/* Worst (longest) instance of each event per drop window. */
-bad_slice_stats AS (
-    SELECT row_id, event_name, slice_id, dur AS bad_dur
-    FROM ranked_instances
-    WHERE row_id != 11 AND inst_rank = 1
+bad_slice_stats AS MATERIALIZED (
+    SELECT
+        sw.row_id,
+        sw.event_name,
+        COUNT(*) AS bad_cnt,
+        SUM(sw.dur) AS bad_dur
+    FROM slices_in_windows sw
+    WHERE sw.row_id != 11
+    GROUP BY sw.row_id, sw.event_name
 ),
 ranked_differences AS (
     SELECT
         bss.row_id,
         bss.event_name,
-        bss.slice_id,
-        gss.good_dur,
+        bss.bad_cnt,
         bss.bad_dur,
-        ROW_NUMBER() OVER (PARTITION BY bss.row_id ORDER BY (bss.bad_dur - COALESCE(gss.good_dur, 0)) DESC) AS diff_rank
+        ROUND(COALESCE(gss.total_good_cnt, 0) * 1.0 * wb.expected_frames / gv.expected_frames) AS good_cnt_scaled,
+        (COALESCE(gss.total_good_dur, 0) * 1.0 * wb.expected_frames / gv.expected_frames) AS good_dur_scaled,
+        ((bss.bad_dur) - (COALESCE(gss.total_good_dur, 0) * 1.0 * wb.expected_frames / gv.expected_frames)) AS dur_difference,
+        ROW_NUMBER() OVER (PARTITION BY bss.row_id ORDER BY ((bss.bad_dur) - (COALESCE(gss.total_good_dur, 0) * 1.0 * wb.expected_frames / gv.expected_frames)) DESC) AS diff_rank
     FROM bad_slice_stats bss
-    LEFT JOIN good_slice_stats gss USING (event_name)
+    JOIN window_bounds wb ON wb.row_id = bss.row_id
+    CROSS JOIN good_vsyncs gv
+    LEFT JOIN good_slice_stats gss ON gss.event_name = bss.event_name
 ),
 top_differences AS MATERIALIZED (
     SELECT * FROM ranked_differences WHERE diff_rank <= 3
 ),
 /* Only compute the CPU state breakdown for slices that are reported:
-   the worst instances of the top events and the nominal instances of the same events. */
+   the top events in drop windows and the nominal instances of the same events. */
 breakdown_slices AS MATERIALIZED (
     SELECT sw.*
     FROM slices_in_windows sw
-    WHERE sw.slice_id IN (SELECT slice_id FROM top_differences)
-       OR (sw.row_id = 11 AND sw.event_name IN (SELECT event_name FROM top_differences))
+    WHERE (sw.row_id, sw.event_name) IN (SELECT row_id, event_name FROM top_differences)
+       OR (sw.row_id = 11 AND sw.event_name IN (SELECT DISTINCT event_name FROM top_differences))
 ),
 /* On-CPU time and highest priority while each slice was running. */
 slice_sched AS (
     SELECT
-        bs.slice_id,
+        bs.row_id,
+        bs.event_name,
         SUM(MIN(sc.ts + sc.dur, bs.ts + bs.dur) - MAX(sc.ts, bs.ts)) AS run_dur,
-        MIN(sc.priority) AS priority
+        MIN(sc.priority) AS priority,
+        MIN(bs.thread_name) AS thread_name
     FROM breakdown_slices bs
     JOIN window_sched sc ON sc.row_id = bs.row_id AND sc.utid = bs.utid
     WHERE sc.ts < bs.ts + bs.dur AND sc.ts + sc.dur > bs.ts
-    GROUP BY bs.slice_id
+    GROUP BY bs.row_id, bs.event_name
 ),
 /* Runnable (preempted / waiting for CPU) time during each slice. */
 slice_runnable AS (
     SELECT
-        bs.slice_id,
+        bs.row_id,
+        bs.event_name,
         SUM(MIN(wr.ts + wr.dur, bs.ts + bs.dur) - MAX(wr.ts, bs.ts)) AS rbl_dur
     FROM breakdown_slices bs
     JOIN window_runnable wr ON wr.row_id = bs.row_id AND wr.utid = bs.utid
     WHERE wr.ts < bs.ts + bs.dur AND wr.ts + wr.dur > bs.ts
-    GROUP BY bs.slice_id
-),
-slice_breakdown AS MATERIALIZED (
-    SELECT
-        bs.row_id,
-        bs.slice_id,
-        bs.event_name,
-        bs.thread_name,
-        COALESCE(ssc.run_dur, 0) AS run_dur,
-        COALESCE(sr.rbl_dur, 0) AS rbl_dur,
-        COALESCE(ssc.priority, bs.thread_priority) AS priority
-    FROM breakdown_slices bs
-    LEFT JOIN slice_sched ssc USING (slice_id)
-    LEFT JOIN slice_runnable sr USING (slice_id)
+    GROUP BY bs.row_id, bs.event_name
 ),
 good_breakdown AS (
-    SELECT event_name, AVG(run_dur) AS good_run, AVG(rbl_dur) AS good_rbl
-    FROM slice_breakdown
-    WHERE row_id = 11
-    GROUP BY event_name
+    SELECT
+        bs.event_name,
+        ssc.run_dur AS nominal_run_dur,
+        sr.rbl_dur AS nominal_rbl_dur
+    FROM (SELECT DISTINCT event_name FROM breakdown_slices WHERE row_id = 11) bs
+    LEFT JOIN slice_sched ssc ON ssc.row_id = 11 AND ssc.event_name = bs.event_name
+    LEFT JOIN slice_runnable sr ON sr.row_id = 11 AND sr.event_name = bs.event_name
 ),
 ranked_differences_desc AS (
     SELECT
         td.row_id,
         td.diff_rank,
-        /* Format: "good -> bad (run good -> bad; rbl good -> bad): prio:thread:event" (ms).
+        /* Format: "good -> bad (cnt good -> bad; run good -> bad; rbl good -> bad): prio:thread:event" (ms).
            No commas since the output is CSV. Blocked time = wall - run - rbl. */
-        printf('%.1f -> %.1f (run %.1f -> %.1f; rbl %.1f -> %.1f): %d:%s:%s',
-               COALESCE(td.good_dur, 0) / 1e6, td.bad_dur / 1e6,
-               COALESCE(gb.good_run, 0) / 1e6, sb.run_dur / 1e6,
-               COALESCE(gb.good_rbl, 0) / 1e6, sb.rbl_dur / 1e6,
-               sb.priority, COALESCE(sb.thread_name, '?'), td.event_name) AS event_desc
+        printf('%.1f -> %.1f (cnt %d -> %d; run %.1f -> %.1f; rbl %.1f -> %.1f): %d:%s:%s',
+               COALESCE(td.good_dur_scaled, 0) / 1e6, td.bad_dur / 1e6,
+               CAST(COALESCE(td.good_cnt_scaled, 0) AS INT), td.bad_cnt,
+               (COALESCE(gb.nominal_run_dur, 0) * 1.0 * wb.expected_frames / gv.expected_frames) / 1e6, COALESCE(ssc.run_dur, 0) / 1e6,
+               (COALESCE(gb.nominal_rbl_dur, 0) * 1.0 * wb.expected_frames / gv.expected_frames) / 1e6, COALESCE(sr.rbl_dur, 0) / 1e6,
+               COALESCE(ssc.priority, (SELECT MIN(thread_priority) FROM breakdown_slices WHERE row_id = td.row_id AND event_name = td.event_name)),
+               COALESCE(ssc.thread_name, (SELECT MIN(thread_name) FROM breakdown_slices WHERE row_id = td.row_id AND event_name = td.event_name), '?'),
+               td.event_name) AS event_desc
     FROM top_differences td
-    JOIN slice_breakdown sb USING (slice_id)
+    JOIN window_bounds wb ON wb.row_id = td.row_id
+    CROSS JOIN good_vsyncs gv
+    LEFT JOIN slice_sched ssc ON ssc.row_id = td.row_id AND ssc.event_name = td.event_name
+    LEFT JOIN slice_runnable sr ON sr.row_id = td.row_id AND sr.event_name = td.event_name
     LEFT JOIN good_breakdown gb ON gb.event_name = td.event_name
 ),
 top_events_pivoted AS (
