@@ -531,6 +531,36 @@ frame_drops AS (
     FROM xr_compositor_frame_metrics
     JOIN process USING (upid)
     GROUP BY upid
+    /* BEGIN FSM SplitEngine app frame drops */
+    UNION ALL
+    SELECT
+        fsm_app.upid,
+        process.name AS name,
+        SUM(
+            CASE
+                WHEN NOT EXISTS (
+                    SELECT 1
+                    FROM slice child
+                    WHERE child.parent_id = s.id
+                      AND child.name = 'CommandDispatcher::operator()'
+                ) THEN 1
+                ELSE 0
+            END
+        ) AS drops
+    FROM (
+        SELECT DISTINCT upid
+        FROM thread_slice
+        WHERE name = 'SplitEngineSerializerImpl::SendAllBatches'
+    ) fsm_app
+    JOIN process USING (upid)
+    CROSS JOIN (
+        SELECT s.id
+        FROM thread_slice s
+        WHERE s.name = 'View::AdvanceForegroundExecutor'
+          AND s.thread_name = 'SpfMain'
+    ) s
+    GROUP BY fsm_app.upid
+    /* END FSM SplitEngine app frame drops */
 ),
 frame_counts AS (
     SELECT
