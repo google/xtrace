@@ -39,7 +39,7 @@ Help pinpoint performance problems with deep knowledge of Android XR, Adreno GPU
 *   If a GC finalizer thread shows on drop cases, a GC pause probably caused the drop.
 *   We may not see the SysUI GPU usage, so if there is any evidence of SysUI rendering in --frame-stats or --top (like high CPU usage) then that could explain app frame drops where it appears the app CPU and GPU usage is okay. If so, and this is not intended, then the user needs to trace again without triggering SysUI activity.
 *   If the problem appears to be background CPU activity from other system processes, then it can help to determine if this was a temporary issue or not by running another --perf-dump trace.
-*   TopProcessPct shows the % of window time consumed by the top processes. Can identify changes in background process behavior.
+*   TopProcessPct shows the % of window time consumed by top processes (format: `good -> bad:proc_name`). Spikes (e.g. `1 -> 78:/system/bin/logd`) identify background processes taking CPU away from the app during drop frames.
 *   RunnableMSPF shows the MS per frame that the process threads were in runnable state. This includes background threads that are not synchronized with per-frame code, so it may not always correlate well with frame drop cases where the time per frame is higher than the nominal case.
 *   RunnableHiPrioMSPF is the same as RunnableMSPF but only for threads < 120 priority, which are more likely to be on the critical path for a frame. An increase compared to nominal suggests CPU contention is delaying important app threads.
 

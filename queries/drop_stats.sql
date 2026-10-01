@@ -233,21 +233,50 @@ process_cpu_in_window AS (
     WHERE t.name != 'swapper' AND t.name IS NOT NULL
     GROUP BY wb.row_id, COALESCE(p.name, t.name)
 ),
+proc_pct_calculated AS (
+    SELECT
+        row_id,
+        proc_name,
+        dur_ns,
+        CAST(ROUND(100.0 * dur_ns / (wb.w_end - wb.w_start)) AS INTEGER) AS pct
+    FROM process_cpu_in_window
+    JOIN window_bounds wb USING (row_id)
+),
+nominal_proc_pct AS (
+    SELECT proc_name, pct AS good_pct
+    FROM proc_pct_calculated
+    WHERE row_id = 11
+),
 ranked_window_processes AS (
     SELECT
-        *,
-        ROW_NUMBER() OVER (PARTITION BY row_id ORDER BY dur_ns DESC) AS duration_rank
-    FROM process_cpu_in_window
+        p.row_id,
+        p.proc_name,
+        p.pct AS bad_pct,
+        COALESCE(np.good_pct, 0) AS good_pct,
+        ROW_NUMBER() OVER (PARTITION BY p.row_id ORDER BY p.dur_ns DESC) AS duration_rank
+    FROM proc_pct_calculated p
+    LEFT JOIN nominal_proc_pct np USING (proc_name)
 ),
 top_processes_pivoted AS (
     SELECT
         row_id,
-        MAX(CASE WHEN duration_rank = 1 THEN printf('%d', ROUND(100.0 * dur_ns / (wb.w_end - wb.w_start))) || ':' || proc_name ELSE NULL END) AS top_process1,
-        MAX(CASE WHEN duration_rank = 2 THEN printf('%d', ROUND(100.0 * dur_ns / (wb.w_end - wb.w_start))) || ':' || proc_name ELSE NULL END) AS top_process2,
-        MAX(CASE WHEN duration_rank = 3 THEN printf('%d', ROUND(100.0 * dur_ns / (wb.w_end - wb.w_start))) || ':' || proc_name ELSE NULL END) AS top_process3,
-        MAX(CASE WHEN duration_rank = 4 THEN printf('%d', ROUND(100.0 * dur_ns / (wb.w_end - wb.w_start))) || ':' || proc_name ELSE NULL END) AS top_process4
+        MAX(CASE WHEN duration_rank = 1 THEN
+            CASE WHEN row_id = 11 THEN printf('%d:%s', bad_pct, proc_name)
+                 ELSE printf('%d -> %d:%s', good_pct, bad_pct, proc_name) END
+            ELSE NULL END) AS top_process1,
+        MAX(CASE WHEN duration_rank = 2 THEN
+            CASE WHEN row_id = 11 THEN printf('%d:%s', bad_pct, proc_name)
+                 ELSE printf('%d -> %d:%s', good_pct, bad_pct, proc_name) END
+            ELSE NULL END) AS top_process2,
+        MAX(CASE WHEN duration_rank = 3 THEN
+            CASE WHEN row_id = 11 THEN printf('%d:%s', bad_pct, proc_name)
+                 ELSE printf('%d -> %d:%s', good_pct, bad_pct, proc_name) END
+            ELSE NULL END) AS top_process3,
+        MAX(CASE WHEN duration_rank = 4 THEN
+            CASE WHEN row_id = 11 THEN printf('%d:%s', bad_pct, proc_name)
+                 ELSE printf('%d -> %d:%s', good_pct, bad_pct, proc_name) END
+            ELSE NULL END) AS top_process4
     FROM ranked_window_processes
-    JOIN window_bounds wb USING (row_id)
     GROUP BY row_id
 ),
 /* All threads of the target processes. */
