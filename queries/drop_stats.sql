@@ -1,5 +1,13 @@
+INCLUDE PERFETTO MODULE slices.with_context;
+
 WITH trace_extents AS (
     SELECT MIN(ts) AS min_ts, MAX(ts) AS max_ts FROM ftrace_event
+),
+fsm_app AS (
+    SELECT DISTINCT upid, p.name AS process_name
+    FROM thread_slice s
+    JOIN process p USING (upid)
+    WHERE s.name = 'SplitEngineSerializerImpl::SendAllBatches'
 ),
 all_slices_on_track AS (
     SELECT
@@ -9,8 +17,34 @@ all_slices_on_track AS (
     JOIN track t ON s.track_id = t.id
     CROSS JOIN trace_extents
     WHERE t.name GLOB 'XRClient #*'
+      AND NOT EXISTS (SELECT 1 FROM fsm_app)
       AND s.ts > trace_extents.min_ts + 100000000
       AND s.ts < trace_extents.max_ts - 100000000
+    /* BEGIN FSM SplitEngine app frame drops */
+    UNION ALL
+    SELECT
+        s.ts,
+        10000000 AS dur,
+        CASE
+            WHEN EXISTS (
+                SELECT 1
+                FROM slice child
+                WHERE child.parent_id = s.id
+                  AND child.name = 'CommandDispatcher::operator()'
+            ) THEN 'Display'
+            ELSE 'Reprojected'
+        END AS name,
+        s.track_id,
+        'XRClient #0 ''' || (SELECT process_name FROM fsm_app) || '''' AS track_name,
+        ROW_NUMBER() OVER (ORDER BY s.ts) AS seq_num
+    FROM thread_slice s
+    CROSS JOIN trace_extents
+    WHERE EXISTS (SELECT 1 FROM fsm_app)
+      AND s.name = 'View::AdvanceForegroundExecutor'
+      AND s.thread_name = 'SpfMain'
+      AND s.ts > trace_extents.min_ts + 100000000
+      AND s.ts < trace_extents.max_ts - 100000000
+    /* END FSM SplitEngine app frame drops */
 ),
 reprojected_only AS (
     SELECT *, ROW_NUMBER() OVER (PARTITION BY track_id ORDER BY ts) AS rep_seq_num
@@ -77,6 +111,13 @@ client_cpu_only AS (
     FROM slice s
     JOIN track t ON s.track_id = t.id
     WHERE t.name GLOB 'XRClient #*' AND s.name = 'clientCPU'
+    /* BEGIN FSM SplitEngine app CPU frame batches */
+    UNION ALL
+    SELECT s.ts, s.dur, s.name, s.track_id, 'XRClient #0 ''' || (SELECT process_name FROM fsm_app) || '''' AS track_name
+    FROM thread_slice s
+    WHERE s.name = 'SplitEngineSerializerImpl::SendAllBatches'
+      AND EXISTS (SELECT 1 FROM fsm_app)
+    /* END FSM SplitEngine app CPU frame batches */
 ),
 client_cpu_intersections AS (
     SELECT
